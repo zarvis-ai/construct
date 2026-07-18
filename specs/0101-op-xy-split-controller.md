@@ -3,34 +3,40 @@
 Status: accepted
 Date: 2026-07-17
 Area: tui
-Scope: An OP-XY Instrument-mode template controls four Construct split panes and receives aggregate session status feedback.
+Scope: An OP-XY Instrument-mode template selects eight sessions, places them in four split panes, and receives status feedback.
 
 ## Decision
 
 Construct supports an opt-in OP-XY profile alongside generic learned MIDI
-mappings. Four learned MIDI channels address visible split panes in visual
-reading order. Each pane track also has a learned first-key anchor so differing
-track octaves normalize to one physical-key layout. Eight learned notes select
-addressed pane; learned arrow and Enter notes dispatch native TUI input to that
-pane. A reserved sequencer-display note is always consumed as a no-op.
+mappings. MIDI channels 1–8 address session title slots `[1]`–`[8]`. Each track
+has a learned first-key anchor so differing octaves normalize to one physical
+key layout. Black keys 1–4 place the channel-selected session in the
+corresponding visible split pane in reading order. Black key 5 cycles focus
+among that session's split, list row, and lineage section. Black keys 6–8 are
+Escape, the sequencer-display no-op, and Backspace respectively. Learned arrow
+and Enter notes dispatch native TUI input to the selected session's visible
+split.
 
 Session titles beginning with `[1]` through `[8]` assign those sessions to the
 corresponding hardware slots. If multiple titles claim one slot, the session
 with the latest activity wins; creation time breaks the absence of activity,
-and session id makes exact ties deterministic. Every recognized OP-XY control
-first focuses the pane addressed by the selected track and then performs its
-action. The reserved sequencer-display no-op never changes focus.
+and session id makes exact ties deterministic. Session commands locate and
+focus the split already displaying the channel-selected session; they never
+silently target a different session. The reserved black-key no-op never changes
+focus.
 
-White keys 1–6 are configurable prompt slots. A configured key focuses its
-track's pane and inserts the assigned text into that pane's session composer
+White keys 1–6 are configurable prompt slots. A configured key focuses the
+split containing the channel-selected session and inserts text into its composer
 without submitting it. Empty or missing prompt slots do nothing. Their notes
-are derived from the learned first-black-key anchor and normalized across pane
-track octaves, so adding prompts does not require relearning the controller.
+are derived from the learned first-black-key anchor and normalized across
+session-track octaves, so adding prompts does not require relearning the
+controller.
 
 The Auxiliary 3 external-MIDI track reuses every learned black- and white-key
-meaning but addresses the currently focused split pane instead of a
-track-selected pane. Its note channels are configurable and default to MIDI
-channel 10. Its existing absolute-encoder controls remain independent of this
+meaning but derives session identity from the currently focused split because
+its channel does not represent a numbered session. Its note channels are
+configurable and default to MIDI channel 10. Its existing absolute-encoder
+controls remain independent of this
 note routing. Auxiliary 2 is reserved for OP-XY's internal Punch-In FX engine
 and does not emit a native MIDI control stream for Construct.
 
@@ -59,11 +65,10 @@ attention marker takes precedence and animates that slot with a damped bounce
 between 30% and 70%. Simultaneous active and attention slots animate together.
 Feedback shutdown resets all eight volumes to zero.
 
-Synth tracks 1–4 are a second, pane-oriented activity display. In visual
-reading order, each track reflects the session shown in its split pane using
-the same idle, running, and attention envelopes, independent of focus. The
-four primary synth parameters move together. Their starting CC is configurable
-and defaults to parameter 1, producing CC 12–15.
+Synth tracks 1–4 are a second activity display for session slots `[1]`–`[4]`,
+independent of split placement and focus. They use the same idle, running, and
+attention envelopes. The four primary synth parameters move together. Their
+starting CC is configurable and defaults to parameter 1, producing CC 12–15.
 
 Auxiliary track 3 supplies generic, focus-sensitive navigation on MIDI channel
 10. Absolute CC 2 maps value changes to Up/Down and absolute CC 3 maps changes
@@ -73,7 +78,7 @@ in the shortest direction around the 0–127 range, so boundary crossings do not
 reverse the control unexpectedly. CC 0 and CC 1 remain unassigned.
 
 Bluetooth feedback traffic is bounded: animation is at most five packets per
-second, with all mixer-volume and split-pane synth-parameter messages for a
+second, with all mixer-volume and session-track synth-parameter messages for a
 frame batched into one packet.
 Construct does not stream MIDI clock because OP-XY can start its sequencer from
 its internal clock, and sustained clock plus per-track packets can lock its BLE
@@ -83,9 +88,9 @@ receive path until the device is power-cycled.
 
 OP-XY Instrument mode exposes linked-track notes, its sequencer, and MIDI
 parameter reception simultaneously, while Controller Mode loses track and
-mode buttons. Channel-addressed panes preserve the physical track model, and
-persistent session slots avoid coupling hardware keys to a changing session
-list order.
+mode buttons. Channel-addressed sessions keep the TUI `[N]` title, track button,
+mixer track, and synth feedback identity consistent. Persistent session slots
+avoid coupling hardware keys to a changing session-list order.
 
 OP-XY does not expose documented direct LED control, MMC reception, record
 arming, parameter readback, or incoming virtual-button commands. Preconfigured
@@ -94,8 +99,10 @@ depending on proprietary SysEx.
 
 ## Consequences
 
-- The OP-XY project template, key layout, channels, and display no-op are
-  learned rather than hard-coded.
+- MIDI channels 1–8 have fixed session-slot meaning; the key layout, octave
+  anchors, and display no-op are learned.
+- Instrument-to-MIDI linking is optional and affects OP-XY playability and
+  synth visualization, not Construct's session identity.
 - Pane numbering follows current visual geometry, not split-tree creation
   order.
 - Missing panes and unresolved session slots produce visible status messages and do

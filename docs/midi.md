@@ -25,10 +25,11 @@ feature is unsupported instead of acquiring a system audio-library dependency.
 ## Dedicated OP-XY split controller
 
 Construct also supports an OP-XY project template that stays in Instrument
-mode. Link instrument tracks 1–4 to external-MIDI tracks 5–8 and give those
-external tracks four distinct MIDI channels. The four channels address the
-visible Construct split panes in reading order: left-to-right, then
-top-to-bottom.
+mode. MIDI channels 1–8 directly address sessions `[1]`–`[8]`. Instrument
+tracks 1–4 may optionally be linked to external-MIDI tracks configured for
+channels 1–4; linking is only needed when those synth tracks should remain
+playable and show Construct's parameter animation. MIDI tracks for channels
+5–8 can be used directly.
 
 Stop the OP-XY sequencer, connect Bluetooth or USB MIDI, then run:
 
@@ -36,11 +37,10 @@ Stop the OP-XY sequencer, connect Bluetooth or USB MIDI, then run:
 construct midi op-xy-learn --device OP-XY
 ```
 
-The wizard captures each pane track's channel and first-key anchor, eight black
-session keys, four arrow keys, Enter, and the white note reserved for sequencer
-display. Per-track anchors normalize octave differences between linked OP-XY
-tracks. The result is stored under `[op_xy]` in `midi.toml`; normal learned
-mappings can coexist with it.
+The wizard verifies channels 1–8 and captures each track's first-key anchor,
+the eight black keys, four arrow keys, and Enter. Per-track anchors normalize
+octave differences between linked OP-XY tracks. The result is stored under
+`[op_xy]` in `midi.toml`; normal learned mappings can coexist with it.
 
 Prefix a session title with its black-key slot number:
 
@@ -54,15 +54,25 @@ Construct detects `[1]` through `[8]` at the beginning of session titles. If
 multiple sessions claim the same number, the one with the latest activity is
 selected.
 
-Every recognized OP-XY key first focuses the pane addressed by the current
-track and then performs its action. Session keys switch that pane's session,
-arrows dispatch the corresponding native TUI arrow, and Enter acts on the now
-focused pane. The reserved sequencer-display no-op does not change focus.
+The MIDI channel selects the session. Black keys then choose the destination
+or action:
 
-White keys 1–6 can insert user-defined prompt text. Like every other recognized
-track key, a prompt key first focuses the split pane addressed by that track.
-Construct then pastes the configured text into that pane's session input without
-submitting it, leaving it available to edit or send with the Enter key. Assign
+- Black keys 1–4 display the selected session in split panes 1–4 and focus it.
+- Black key 5 cycles focus through the split containing the selected session,
+  its session-list row, and its lineage section. If it is not already shown in
+  a split, the cycle starts at the list.
+- Black key 6 sends Escape.
+- Black key 7 is the sequencer-display no-op and never changes focus.
+- Black key 8 sends Backspace.
+
+Arrows, Enter, and prompt keys locate the channel-selected session in a visible
+split, focus that split, and act on it. If the session is not displayed, these
+commands report that condition rather than targeting another session.
+
+White keys 1–6 can insert user-defined prompt text. Construct first focuses the
+split containing the channel-selected session, then pastes the configured text
+into that session's input without submitting it, leaving it available to edit
+or send with the Enter key. Assign
 the keys in order under `[op_xy]`; use an empty string to leave a position
 unassigned:
 
@@ -78,15 +88,17 @@ prompt_texts = [
 ]
 ```
 
-Existing learned profiles do not need to be relearned. Construct derives the
-six white-key notes from the profile's first-black-key anchor and applies the
-same per-track octave normalization used by the session keys.
+After learning the session-centric profile, prompt text can change without
+relearning. Construct derives the six white-key notes from the profile's
+first-black-key anchor and applies the same per-track octave normalization.
+Profiles learned with the older pane-centric layout should be learned again.
 
-Auxiliary track 3 can send the same black- and white-key controls as the four
-pane tracks on MIDI channel 10. Instead of addressing a pane by track, these
-notes act on the currently focused split pane. Session selection, custom
-prompts, arrows, Enter, and the reserved no-op retain the learned profile's note
-meanings. Keep Aux 3 at the same note octave as the learned reference track.
+Auxiliary track 3 can send the same black- and white-key controls on MIDI
+channel 10. Because it has no `[N]` session channel, it uses the session in the
+currently focused split. Split selection, focus cycling, Escape, Backspace,
+custom prompts, arrows, Enter, and the reserved no-op retain the learned
+profile's note meanings. Keep Aux 3 at the same note octave as the learned
+reference track.
 
 Auxiliary track 2 is OP-XY's internal Punch-In FX track. Its keys and encoders
 control that effect engine and do not produce external MIDI for Construct to
@@ -143,12 +155,11 @@ the aggregate scene. Mixer tracks 1–8 correspond to title slots
 Multiple active and attention slots animate together. Exiting Construct resets
 all eight track volumes to zero.
 
-Synth tracks 1–4 independently mirror the sessions shown in split panes 1–4,
-using the same idle, running, and attention envelopes. This indicator is based
-on each pane's session rather than keyboard focus. All four primary synth
-parameters move together. Their default targets are CC 12–15; choose another
-starting CC from the OP-XY track-parameter range when the template uses a
-different engine or preferred visual controls.
+Synth tracks 1–4 mirror session slots `[1]`–`[4]`, using the same idle, running,
+and attention envelopes independently of split placement or keyboard focus.
+All four primary synth parameters move together. Their default targets are CC
+12–15; choose another starting CC from the OP-XY track-parameter range when the
+template uses a different engine or preferred visual controls.
 
 Construct sends MIDI Start/Stop for transport but deliberately leaves timing to
 the OP-XY's internal clock. Animation updates are limited to five batched packets
@@ -161,15 +172,15 @@ Scene defaults can be edited in `midi.toml`:
 enabled = true
 normal_scene = 1
 attention_scene = 2
-split_activity_cc = 12
+track_activity_cc = 12
 ```
 
-`split_activity_cc` is the first of four consecutive parameter CCs.
+`track_activity_cc` is the first of four consecutive parameter CCs. The legacy
+name `split_activity_cc` is still accepted when reading an existing profile.
 
 Scenes store track volume and mute state, so the Construct template should use
 identical volume/mute settings in every feedback scene. Disable MIDI echo on
-the OP-XY, and reserve the learned no-op note exclusively for the display
-patterns.
+the OP-XY, and reserve black key 7 exclusively for the display patterns.
 
 ## Learn controls
 

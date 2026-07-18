@@ -59,7 +59,11 @@ pub enum MidiCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpXyControl {
-    Session(usize),
+    Split(usize),
+    CycleFocus,
+    Escape,
+    NoOp,
+    Backspace,
     Prompt { slot: usize, text: String },
     Left,
     Down,
@@ -78,8 +82,8 @@ pub(crate) enum OpXyAuxControl {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpXyEvent {
-    /// Zero-based visual pane position: left-to-right, then top-to-bottom.
-    pub pane: usize,
+    /// Zero-based `[1]`–`[8]` session slot selected by MIDI channel 1–8.
+    pub session: usize,
     pub control: OpXyControl,
 }
 
@@ -115,9 +119,9 @@ pub(crate) struct FeedbackSnapshot {
     /// Bit 0 is session slot `[1]`; bit 7 is session slot `[8]`.
     pub active_slots: u8,
     pub attention_slots: u8,
-    /// Low four bits correspond to split panes 1–4 in visual reading order.
-    pub active_panes: u8,
-    pub attention_panes: u8,
+    /// Low four bits correspond to session slots `[1]`–`[4]` and their synth tracks.
+    pub active_tracks: u8,
+    pub attention_tracks: u8,
 }
 
 impl Default for FeedbackSnapshot {
@@ -126,8 +130,8 @@ impl Default for FeedbackSnapshot {
             fleet: FeedbackState::Idle,
             active_slots: 0,
             attention_slots: 0,
-            active_panes: 0,
-            attention_panes: 0,
+            active_tracks: 0,
+            attention_tracks: 0,
         }
     }
 }
@@ -140,7 +144,8 @@ pub struct OpXyFeedbackConfig {
     pub normal_scene: u8,
     pub attention_scene: u8,
     /// First of four consecutive OP-XY synth parameters. Defaults to CC 12–15.
-    pub split_activity_cc: u8,
+    #[serde(alias = "split_activity_cc")]
+    pub track_activity_cc: u8,
 }
 
 impl Default for OpXyFeedbackConfig {
@@ -149,7 +154,7 @@ impl Default for OpXyFeedbackConfig {
             enabled: true,
             normal_scene: 1,
             attention_scene: 2,
-            split_activity_cc: 12,
+            track_activity_cc: 12,
         }
     }
 }
@@ -247,11 +252,17 @@ fn absolute_encoder_direction(previous: u8, current: u8) -> Option<EncoderDirect
 #[serde(default)]
 pub struct OpXyConfig {
     pub enabled: bool,
-    /// One-based MIDI channels corresponding to visual panes 1 through 4.
-    pub pane_channels: Vec<u8>,
-    /// First black-key note on each pane track, used to normalize track octaves.
-    pub pane_anchor_notes: Vec<u8>,
-    pub session_notes: Vec<u8>,
+    /// MIDI channels whose first-black-key anchors were learned. Channels 1–8
+    /// always address session slots `[1]`–`[8]`; this list only normalizes
+    /// tracks that use different octaves.
+    #[serde(alias = "pane_channels")]
+    pub session_channels: Vec<u8>,
+    /// First black-key note for each entry in `session_channels`.
+    #[serde(alias = "pane_anchor_notes")]
+    pub track_anchor_notes: Vec<u8>,
+    /// The eight black-key notes, learned on the reference track.
+    #[serde(alias = "session_notes")]
+    pub black_notes: Vec<u8>,
     /// Prompt text assigned to white keys 1–6. Empty or missing entries are unassigned.
     pub prompt_texts: Vec<String>,
     pub left_note: Option<u8>,
@@ -259,7 +270,8 @@ pub struct OpXyConfig {
     pub right_note: Option<u8>,
     pub up_note: Option<u8>,
     pub enter_note: Option<u8>,
-    /// A sequenced display note that Construct must consume without action.
+    /// Legacy white-key no-op retained only for old profile compatibility.
+    /// New profiles reserve black key 7 instead.
     pub no_op_note: Option<u8>,
     pub aux: OpXyAuxConfig,
     pub feedback: OpXyFeedbackConfig,
@@ -270,21 +282,26 @@ impl OpXyConfig {
         if !self.enabled || message.kind != MidiMessageKind::Note || !message.pressed {
             return None;
         }
-        let pane = self
-            .pane_channels
+        let session = usize::from(message.channel.checked_sub(1)?);
+        if session >= 8 {
+            return None;
+        }
+        let reference_anchor = self.black_notes.first().copied()?;
+        let anchor_index = self
+            .session_channels
             .iter()
-            .position(|channel| *channel == message.channel)?;
-        let reference_anchor = self.session_notes.first().copied()?;
-        let pane_anchor = self
-            .pane_anchor_notes
-            .get(pane)
+            .position(|channel| *channel == message.channel);
+        let track_anchor = anchor_index
+            .and_then(|index| self.track_anchor_notes.get(index))
             .copied()
             .unwrap_or(reference_anchor);
-        let normalized_note = i16::from(message.number) + i16::from(reference_anchor)
-            - i16::from(pane_anchor);
-        let normalized_note = u8::try_from(normalized_note).ok().filter(|note| *note <= 127)?;
+        let normalized_note =
+            i16::from(message.number) + i16::from(reference_anchor) - i16::from(track_anchor);
+        let normalized_note = u8::try_from(normalized_note)
+            .ok()
+            .filter(|note| *note <= 127)?;
         let control = self.control_for_note(normalized_note)?;
-        Some(OpXyEvent { pane, control })
+        Some(OpXyEvent { session, control })
     }
 
     fn focused_event_for(&self, message: &MidiMessage) -> Option<OpXyControl> {
@@ -292,10 +309,7 @@ impl OpXyConfig {
             || message.kind != MidiMessageKind::Note
             || !message.pressed
             || !self.aux.enabled
-            || !self
-                .aux
-                .focused_note_channels
-                .contains(&message.channel)
+            || !self.aux.focused_note_channels.contains(&message.channel)
         {
             return None;
         }
@@ -303,16 +317,20 @@ impl OpXyConfig {
     }
 
     fn control_for_note(&self, normalized_note: u8) -> Option<OpXyControl> {
-        let reference_anchor = self.session_notes.first().copied()?;
-        if self.no_op_note == Some(normalized_note) {
-            return None;
-        }
-        let control = if let Some(slot) = self
-            .session_notes
+        let reference_anchor = self.black_notes.first().copied()?;
+        let control = if let Some(key) = self
+            .black_notes
             .iter()
             .position(|note| *note == normalized_note)
         {
-            OpXyControl::Session(slot)
+            match key {
+                0..=3 => OpXyControl::Split(key),
+                4 => OpXyControl::CycleFocus,
+                5 => OpXyControl::Escape,
+                6 => OpXyControl::NoOp,
+                7 => OpXyControl::Backspace,
+                _ => return None,
+            }
         } else if let Some((slot, text)) = self
             .prompt_texts
             .iter()
@@ -703,9 +721,12 @@ fn print_mappings() -> Result<()> {
         );
     }
     if let Some(op_xy) = config.op_xy {
-        println!("op-xy: {}", if op_xy.enabled { "enabled" } else { "disabled" });
-        println!("  pane channels: {:?}", op_xy.pane_channels);
-        println!("  session notes: {:?}", op_xy.session_notes);
+        println!(
+            "op-xy: {}",
+            if op_xy.enabled { "enabled" } else { "disabled" }
+        );
+        println!("  session channels: {:?}", op_xy.session_channels);
+        println!("  black notes: {:?}", op_xy.black_notes);
         for (slot, prompt) in op_xy.prompt_texts.iter().take(6).enumerate() {
             if !prompt.is_empty() {
                 println!("  white prompt {}: {:?}", slot + 1, prompt);
@@ -764,48 +785,49 @@ fn op_xy_learn(requested_device: Option<&str>) -> Result<()> {
 
     eprintln!("listening on {port_name:?}");
     eprintln!("Use the linked OP-XY Construct template, not Controller Mode.");
-    let first = capture(
-        &rx,
-        "Select track 1 and press the first black session key…",
-    )?;
-    let mut pane_channels = vec![first.channel];
-    let mut pane_anchor_notes = vec![first.number];
-    for pane in 2..=4 {
+    let first = capture(&rx, "Select MIDI-channel track 1 and press black key 1…")?;
+    if first.channel != 1 {
+        anyhow::bail!(
+            "track 1 sent MIDI channel {}; configure it for channel 1 and learn again",
+            first.channel
+        );
+    }
+    let mut session_channels = vec![first.channel];
+    let mut track_anchor_notes = vec![first.number];
+    for session in 2..=8 {
         let message = capture(
             &rx,
-            &format!("Select track {pane} and press the same first black session key…"),
+            &format!("Select MIDI-channel track {session} and press black key 1…"),
         )?;
-        pane_channels.push(message.channel);
-        pane_anchor_notes.push(message.number);
+        if message.channel != session {
+            anyhow::bail!(
+                "track {session} sent MIDI channel {}; configure it for channel {session} and learn again",
+                message.channel
+            );
+        }
+        session_channels.push(message.channel);
+        track_anchor_notes.push(message.number);
     }
-    let mut session_notes = vec![first.number];
+    let mut black_notes = vec![first.number];
     eprintln!("Return to track 1.");
-    for slot in 2..=8 {
-        session_notes.push(
-            capture(&rx, &format!("Press black session key {slot}…"))?.number,
-        );
+    for key in 2..=8 {
+        black_notes.push(capture(&rx, &format!("Press black key {key}…"))?.number);
     }
     let left_note = capture(&rx, "Press the LEFT arrow key…")?.number;
     let down_note = capture(&rx, "Press the DOWN arrow key…")?.number;
     let right_note = capture(&rx, "Press the RIGHT arrow key…")?.number;
     let up_note = capture(&rx, "Press the UP arrow key…")?.number;
     let enter_note = capture(&rx, "Press the final black ENTER key…")?.number;
-    let no_op_note = capture(
-        &rx,
-        "Press the white key reserved as the sequencer display no-op…",
-    )?
-    .number;
-
-    let unique_channels: std::collections::HashSet<_> = pane_channels.iter().copied().collect();
-    if unique_channels.len() != 4 {
+    let unique_channels: std::collections::HashSet<_> = session_channels.iter().copied().collect();
+    if unique_channels.len() != 8 {
         anyhow::bail!(
-            "the four OP-XY tracks did not produce four distinct MIDI channels; check the linked external-track channel settings and learn again"
+            "the eight OP-XY tracks did not produce eight distinct MIDI channels; check their external MIDI channel settings and learn again"
         );
     }
-    let all_notes = session_notes
+    let all_notes = black_notes
         .iter()
         .copied()
-        .chain([left_note, down_note, right_note, up_note, enter_note, no_op_note]);
+        .chain([left_note, down_note, right_note, up_note, enter_note]);
     let unique_notes: std::collections::HashSet<_> = all_notes.clone().collect();
     if unique_notes.len() != all_notes.count() {
         anyhow::bail!(
@@ -816,16 +838,16 @@ fn op_xy_learn(requested_device: Option<&str>) -> Result<()> {
     config.device = Some(port_name);
     config.op_xy = Some(OpXyConfig {
         enabled: true,
-        pane_channels,
-        pane_anchor_notes,
-        session_notes,
+        session_channels,
+        track_anchor_notes,
+        black_notes,
         prompt_texts: Vec::new(),
         left_note: Some(left_note),
         down_note: Some(down_note),
         right_note: Some(right_note),
         up_note: Some(up_note),
         enter_note: Some(enter_note),
-        no_op_note: Some(no_op_note),
+        no_op_note: None,
         aux: OpXyAuxConfig::default(),
         feedback: OpXyFeedbackConfig::default(),
     });
@@ -912,12 +934,12 @@ fn feedback_loop(
     send_scene(&mut connection, config.normal_scene);
     let _ = connection.send(&[0xFC]);
     send_slot_volumes(&mut connection, u8::MAX, 0);
-    send_pane_parameters(&mut connection, 0b0000_1111, config.split_activity_cc, 0);
+    send_pane_parameters(&mut connection, 0b0000_1111, config.track_activity_cc, 0);
     loop {
         let any_activity = snapshot.active_slots
             | snapshot.attention_slots
-            | snapshot.active_panes
-            | snapshot.attention_panes;
+            | snapshot.active_tracks
+            | snapshot.attention_tracks;
         let timeout = if any_activity != 0 {
             VOLUME_FRAME_PERIOD
         } else {
@@ -951,15 +973,15 @@ fn feedback_loop(
                     volume_frame = 0;
                     next_volume_frame = std::time::Instant::now();
                 }
-                if next.active_panes != snapshot.active_panes
-                    || next.attention_panes != snapshot.attention_panes
+                if next.active_tracks != snapshot.active_tracks
+                    || next.attention_tracks != snapshot.attention_tracks
                 {
-                    let previous_visible = snapshot.active_panes | snapshot.attention_panes;
-                    let next_visible = next.active_panes | next.attention_panes;
+                    let previous_visible = snapshot.active_tracks | snapshot.attention_tracks;
+                    let next_visible = next.active_tracks | next.attention_tracks;
                     send_pane_parameters(
                         &mut connection,
                         previous_visible & !next_visible,
-                        config.split_activity_cc,
+                        config.track_activity_cc,
                         0,
                     );
                     volume_frame = 0;
@@ -970,7 +992,7 @@ fn feedback_loop(
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 send_slot_volumes(&mut connection, u8::MAX, 0);
-                send_pane_parameters(&mut connection, 0b0000_1111, config.split_activity_cc, 0);
+                send_pane_parameters(&mut connection, 0b0000_1111, config.track_activity_cc, 0);
                 let _ = connection.send(&[0xFC]);
                 break;
             }
@@ -978,16 +1000,16 @@ fn feedback_loop(
         let now = std::time::Instant::now();
         let any_activity = snapshot.active_slots
             | snapshot.attention_slots
-            | snapshot.active_panes
-            | snapshot.attention_panes;
+            | snapshot.active_tracks
+            | snapshot.attention_tracks;
         if any_activity != 0 && now >= next_volume_frame {
             send_activity_frame(
                 &mut connection,
                 snapshot.active_slots,
                 snapshot.attention_slots,
-                snapshot.active_panes,
-                snapshot.attention_panes,
-                config.split_activity_cc,
+                snapshot.active_tracks,
+                snapshot.attention_tracks,
+                config.track_activity_cc,
                 ACTIVE_MOTION[volume_frame],
                 ATTENTION_BOUNCE[volume_frame],
             );
@@ -1081,21 +1103,21 @@ fn activity_volume_packet(
 }
 
 fn activity_pane_packet(
-    active_panes: u8,
-    attention_panes: u8,
+    active_tracks: u8,
+    attention_tracks: u8,
     cc: u8,
     active_value: u8,
     attention_value: u8,
 ) -> Vec<u8> {
-    let visible = (active_panes | attention_panes) & 0b0000_1111;
+    let visible = (active_tracks | attention_tracks) & 0b0000_1111;
     let mut packet = Vec::with_capacity(
         visible.count_ones() as usize * usize::from(SPLIT_ACTIVITY_PARAMETER_COUNT) * 3,
     );
     for pane in 0..4 {
         let bit = 1 << pane;
-        let value = if attention_panes & bit != 0 {
+        let value = if attention_tracks & bit != 0 {
             Some(attention_value)
-        } else if active_panes & bit != 0 {
+        } else if active_tracks & bit != 0 {
             Some(active_value)
         } else {
             None
@@ -1116,8 +1138,8 @@ fn send_activity_frame(
     connection: &mut MidiOutputConnection,
     active_slots: u8,
     attention_slots: u8,
-    active_panes: u8,
-    attention_panes: u8,
+    active_tracks: u8,
+    attention_tracks: u8,
     pane_cc: u8,
     active_value: u8,
     attention_value: u8,
@@ -1125,8 +1147,8 @@ fn send_activity_frame(
     let mut packet =
         activity_volume_packet(active_slots, attention_slots, active_value, attention_value);
     packet.extend(activity_pane_packet(
-        active_panes,
-        attention_panes,
+        active_tracks,
+        attention_tracks,
         pane_cc,
         active_value,
         attention_value,
@@ -1430,6 +1452,21 @@ mod tests {
     }
 
     #[test]
+    fn op_xy_session_profile_accepts_legacy_field_names() {
+        let profile: OpXyConfig = toml::from_str(
+            "enabled = true\npane_channels = [1, 2]\npane_anchor_notes = [54, 42]\nsession_notes = [54, 56, 58, 61, 63, 66, 68, 70]\n",
+        )
+        .unwrap();
+        assert_eq!(profile.session_channels, vec![1, 2]);
+        assert_eq!(profile.track_anchor_notes, vec![54, 42]);
+        assert_eq!(profile.black_notes.len(), 8);
+
+        let feedback: OpXyFeedbackConfig =
+            toml::from_str("enabled = true\nsplit_activity_cc = 22\n").unwrap();
+        assert_eq!(feedback.track_activity_cc, 22);
+    }
+
+    #[test]
     fn config_round_trips_as_readable_toml() {
         let config = MidiConfig {
             device: Some("OP-XY".into()),
@@ -1478,9 +1515,9 @@ mod tests {
             mappings: Vec::new(),
             op_xy: Some(OpXyConfig {
                 enabled: true,
-                pane_channels: vec![5, 6, 7, 8],
-                pane_anchor_notes: vec![54, 42, 30, 54],
-                session_notes: vec![54, 56, 58, 61, 63, 66, 68, 70],
+                session_channels: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                track_anchor_notes: vec![54, 42, 30, 54, 54, 54, 54, 54],
+                black_notes: vec![54, 56, 58, 61, 63, 66, 68, 70],
                 prompt_texts: vec!["Review the current changes.".into()],
                 left_note: Some(72),
                 down_note: Some(74),
@@ -1513,8 +1550,8 @@ mod tests {
             fleet: FeedbackState::Working,
             active_slots: 0b0000_0001,
             attention_slots: 0,
-            active_panes: 0b0000_0001,
-            attention_panes: 0,
+            active_tracks: 0b0000_0001,
+            attention_tracks: 0,
         };
         feedback.update(working);
         assert_eq!(rx.try_recv().unwrap(), working);
@@ -1525,8 +1562,8 @@ mod tests {
             fleet: FeedbackState::AttentionWorking,
             active_slots: 0b0000_0001,
             attention_slots: 0b1000_0001,
-            active_panes: 0b0000_0011,
-            attention_panes: 0b0000_0010,
+            active_tracks: 0b0000_0011,
+            attention_tracks: 0b0000_0010,
         };
         feedback.update(attention);
         assert_eq!(rx.try_recv().unwrap(), attention);
@@ -1587,9 +1624,9 @@ mod tests {
     fn op_xy_profile() -> OpXyConfig {
         OpXyConfig {
             enabled: true,
-            pane_channels: vec![13, 14, 15, 16],
-            pane_anchor_notes: vec![49; 4],
-            session_notes: vec![49, 51, 54, 56, 58, 61, 63, 66],
+            session_channels: (1..=8).collect(),
+            track_anchor_notes: vec![49; 8],
+            black_notes: vec![49, 51, 54, 56, 58, 61, 63, 66],
             prompt_texts: Vec::new(),
             left_note: Some(60),
             down_note: Some(62),
@@ -1603,14 +1640,14 @@ mod tests {
     }
 
     #[test]
-    fn op_xy_maps_channel_to_pane_and_note_to_session_slot() {
+    fn op_xy_maps_channel_to_session_and_black_key_to_split() {
         let profile = op_xy_profile();
-        let message = parse_message(&[0x9e, 56, 100]).unwrap();
+        let message = parse_message(&[0x92, 56, 100]).unwrap();
         assert_eq!(
             profile.event_for(&message),
             Some(OpXyEvent {
-                pane: 2,
-                control: OpXyControl::Session(3),
+                session: 2,
+                control: OpXyControl::Split(3),
             })
         );
     }
@@ -1622,7 +1659,7 @@ mod tests {
 
         assert_eq!(
             profile.focused_event_for(&parse_message(&[0x99, 56, 100]).unwrap()),
-            Some(OpXyControl::Session(3))
+            Some(OpXyControl::Split(3))
         );
         assert_eq!(
             profile.focused_event_for(&parse_message(&[0x99, 48, 100]).unwrap()),
@@ -1650,18 +1687,19 @@ mod tests {
     }
 
     #[test]
-    fn op_xy_normalizes_each_pane_tracks_octave() {
+    fn op_xy_normalizes_each_session_tracks_octave() {
         let mut profile = op_xy_profile();
-        profile.pane_channels = vec![5, 6, 7, 8];
-        profile.pane_anchor_notes = vec![54, 42, 30, 54];
-        profile.session_notes = vec![54, 56, 58, 61, 63, 66, 68, 70];
+        profile.session_channels = (1..=8).collect();
+        profile.track_anchor_notes = vec![54, 42, 30, 54, 54, 54, 54, 54];
+        profile.black_notes = vec![54, 56, 58, 61, 63, 66, 68, 70];
 
-        for (status, note, pane) in [(0x94, 56, 0), (0x95, 44, 1), (0x96, 32, 2), (0x97, 56, 3)] {
+        for (status, note, session) in [(0x90, 56, 0), (0x91, 44, 1), (0x92, 32, 2), (0x93, 56, 3)]
+        {
             assert_eq!(
                 profile.event_for(&parse_message(&[status, note, 100]).unwrap()),
                 Some(OpXyEvent {
-                    pane,
-                    control: OpXyControl::Session(1),
+                    session,
+                    control: OpXyControl::Split(1),
                 })
             );
         }
@@ -1670,16 +1708,16 @@ mod tests {
     #[test]
     fn op_xy_maps_white_keys_one_through_six_to_custom_prompts() {
         let mut profile = op_xy_profile();
-        profile.pane_channels = vec![5, 6, 7, 8];
-        profile.pane_anchor_notes = vec![54, 42, 30, 54];
-        profile.session_notes = vec![54, 56, 58, 61, 63, 66, 68, 70];
+        profile.session_channels = (1..=8).collect();
+        profile.track_anchor_notes = vec![54, 42, 30, 54, 54, 54, 54, 54];
+        profile.black_notes = vec![54, 56, 58, 61, 63, 66, 68, 70];
         profile.prompt_texts = (1..=6).map(|slot| format!("prompt {slot}")).collect();
 
         for (slot, note) in [53, 55, 57, 59, 60, 62].into_iter().enumerate() {
             assert_eq!(
-                profile.event_for(&parse_message(&[0x94, note, 100]).unwrap()),
+                profile.event_for(&parse_message(&[0x90, note, 100]).unwrap()),
                 Some(OpXyEvent {
-                    pane: 0,
+                    session: 0,
                     control: OpXyControl::Prompt {
                         slot,
                         text: format!("prompt {}", slot + 1),
@@ -1689,9 +1727,9 @@ mod tests {
         }
 
         assert_eq!(
-            profile.event_for(&parse_message(&[0x95, 41, 100]).unwrap()),
+            profile.event_for(&parse_message(&[0x91, 41, 100]).unwrap()),
             Some(OpXyEvent {
-                pane: 1,
+                session: 1,
                 control: OpXyControl::Prompt {
                     slot: 0,
                     text: "prompt 1".into(),
@@ -1703,18 +1741,18 @@ mod tests {
     #[test]
     fn op_xy_leaves_empty_prompt_slots_unassigned() {
         let mut profile = op_xy_profile();
-        profile.pane_channels = vec![5, 6, 7, 8];
-        profile.pane_anchor_notes = vec![54; 4];
-        profile.session_notes = vec![54, 56, 58, 61, 63, 66, 68, 70];
+        profile.session_channels = (1..=8).collect();
+        profile.track_anchor_notes = vec![54; 8];
+        profile.black_notes = vec![54, 56, 58, 61, 63, 66, 68, 70];
         profile.prompt_texts = vec![String::new(), "second".into()];
 
         assert!(profile
-            .event_for(&parse_message(&[0x94, 53, 100]).unwrap())
+            .event_for(&parse_message(&[0x90, 53, 100]).unwrap())
             .is_none());
         assert_eq!(
-            profile.event_for(&parse_message(&[0x94, 55, 100]).unwrap()),
+            profile.event_for(&parse_message(&[0x90, 55, 100]).unwrap()),
             Some(OpXyEvent {
-                pane: 0,
+                session: 0,
                 control: OpXyControl::Prompt {
                     slot: 1,
                     text: "second".into(),
@@ -1724,16 +1762,23 @@ mod tests {
     }
 
     #[test]
-    fn op_xy_ignores_release_no_op_and_unknown_channels() {
+    fn op_xy_ignores_release_and_unknown_channels_but_consumes_no_op() {
         let profile = op_xy_profile();
         assert!(profile
-            .event_for(&parse_message(&[0x8c, 49, 0]).unwrap())
+            .event_for(&parse_message(&[0x80, 49, 0]).unwrap())
+            .is_none());
+        assert_eq!(
+            profile.event_for(&parse_message(&[0x90, 63, 100]).unwrap()),
+            Some(OpXyEvent {
+                session: 0,
+                control: OpXyControl::NoOp,
+            })
+        );
+        assert!(profile
+            .event_for(&parse_message(&[0x90, 65, 100]).unwrap())
             .is_none());
         assert!(profile
-            .event_for(&parse_message(&[0x9c, 65, 100]).unwrap())
-            .is_none());
-        assert!(profile
-            .event_for(&parse_message(&[0x90, 49, 100]).unwrap())
+            .event_for(&parse_message(&[0x98, 49, 100]).unwrap())
             .is_none());
     }
 
@@ -1748,8 +1793,30 @@ mod tests {
             (70, OpXyControl::Enter),
         ] {
             assert_eq!(
-                profile.event_for(&parse_message(&[0x9f, note, 100]).unwrap()),
-                Some(OpXyEvent { pane: 3, control })
+                profile.event_for(&parse_message(&[0x97, note, 100]).unwrap()),
+                Some(OpXyEvent {
+                    session: 7,
+                    control,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn op_xy_maps_black_keys_five_through_eight_to_session_controls() {
+        let profile = op_xy_profile();
+        for (note, control) in [
+            (58, OpXyControl::CycleFocus),
+            (61, OpXyControl::Escape),
+            (63, OpXyControl::NoOp),
+            (66, OpXyControl::Backspace),
+        ] {
+            assert_eq!(
+                profile.event_for(&parse_message(&[0x93, note, 100]).unwrap()),
+                Some(OpXyEvent {
+                    session: 3,
+                    control,
+                })
             );
         }
     }

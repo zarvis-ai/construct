@@ -10707,7 +10707,7 @@ impl App {
 
     fn op_xy_pane_window_id(&self, pane: usize) -> Option<u64> {
         let mut areas = self.layout.main_window_areas.clone();
-        // OP-XY tracks use the visual reading order promised by the profile:
+        // OP-XY split-selection keys use the visual reading order promised by the profile:
         // left-to-right within each row, then top-to-bottom.
         areas.sort_by_key(|pane| (pane.area.y, pane.area.x));
         areas
@@ -10716,20 +10716,34 @@ impl App {
             .or_else(|| self.leaf_window_ids().get(pane).copied())
     }
 
-    fn select_op_xy_slot_in_pane(&mut self, pane: usize, slot: usize) {
+    fn op_xy_window_for_session(&self, session_id: &str) -> Option<u64> {
+        let active_matches = self
+            .selection_for_window(self.active_window_id)
+            .is_some_and(|selection| selection.session_id() == Some(session_id));
+        if active_matches {
+            return Some(self.active_window_id);
+        }
+        (0..4).find_map(|pane| {
+            let window_id = self.op_xy_pane_window_id(pane)?;
+            (self
+                .selection_for_window(window_id)
+                .is_some_and(|selection| selection.session_id() == Some(session_id)))
+            .then_some(window_id)
+        })
+    }
+
+    fn select_op_xy_session_in_pane(
+        &mut self,
+        session_id: String,
+        session_label: &str,
+        pane: usize,
+    ) {
         let Some(window_id) = self.op_xy_pane_window_id(pane) else {
             self.set_status(format!("OP-XY pane {} is not visible", pane + 1));
             return;
         };
-        let Some(session_id) = self.resolved_op_xy_session_slots()[slot].clone() else {
-            self.set_status(format!("OP-XY session slot {} is unassigned", slot + 1));
-            return;
-        };
         if !self.sessions.iter().any(|session| session.id == session_id) {
-            self.set_status(format!(
-                "OP-XY session slot {} points to a missing session",
-                slot + 1
-            ));
+            self.set_status(format!("OP-XY session {session_label} is missing"));
             return;
         }
 
@@ -10738,59 +10752,125 @@ impl App {
         }
         self.select_session(session_id);
         self.set_status(format!(
-            "OP-XY pane {} → session slot {}",
+            "OP-XY pane {} → session {}",
             pane + 1,
-            slot + 1
+            session_label
         ));
     }
 
+    fn cycle_op_xy_session_focus(&mut self, session_label: &str, session_id: String) {
+        let session_window = self.op_xy_window_for_session(&session_id);
+        let focused_on_session =
+            self.focus == PaneFocus::View && session_window == Some(self.active_window_id);
+        let focused_on_list_session = self.focus == PaneFocus::List
+            && !self.lineage_focused
+            && self.selected_id().as_deref() == Some(session_id.as_str());
+
+        if focused_on_session {
+            self.select_session(session_id);
+            self.focus = PaneFocus::List;
+            self.lineage_focused = false;
+            self.set_status(format!("OP-XY session {session_label} → list"));
+        } else if focused_on_list_session && self.activate_lineage_focus() {
+            self.set_status(format!("OP-XY session {session_label} → lineage"));
+        } else if let Some(window_id) = session_window {
+            self.focus_main_window(window_id);
+            self.select_session(session_id);
+            self.set_status(format!("OP-XY session {session_label} → split"));
+        } else {
+            self.select_session(session_id);
+            self.focus = PaneFocus::List;
+            self.lineage_focused = false;
+            self.set_status(format!("OP-XY session {session_label} → list"));
+        }
+    }
+
     pub(crate) async fn handle_op_xy_event(&mut self, event: crate::midi::OpXyEvent) {
-        use crate::midi::OpXyControl;
-        let Some(window_id) = self.op_xy_pane_window_id(event.pane) else {
-            self.set_status(format!("OP-XY pane {} is not visible", event.pane + 1));
+        if event.control == crate::midi::OpXyControl::NoOp {
+            return;
+        }
+        let Some(session_id) = self
+            .resolved_op_xy_session_slots()
+            .get(event.session)
+            .cloned()
+            .flatten()
+        else {
+            self.set_status(format!(
+                "OP-XY session slot {} is unassigned",
+                event.session + 1
+            ));
             return;
         };
-        if self.focus != PaneFocus::View || self.active_window_id != window_id {
-            self.focus_main_window(window_id);
+        self.handle_op_xy_control_for_session(
+            session_id,
+            (event.session + 1).to_string(),
+            event.control,
+        )
+        .await;
+    }
+
+    async fn handle_op_xy_control_for_session(
+        &mut self,
+        session_id: String,
+        session_label: String,
+        control: crate::midi::OpXyControl,
+    ) {
+        use crate::midi::OpXyControl;
+        if control == OpXyControl::NoOp {
+            return;
         }
-        match event.control {
-            OpXyControl::Session(slot) => self.select_op_xy_slot_in_pane(event.pane, slot),
-            OpXyControl::Prompt { slot, text } => {
-                let Some(session_id) = self
-                    .selection_for_window(window_id)
-                    .and_then(|selection| selection.session_id().map(str::to_owned))
-                else {
+        match control {
+            OpXyControl::Split(pane) => {
+                self.select_op_xy_session_in_pane(session_id, &session_label, pane);
+            }
+            OpXyControl::CycleFocus => {
+                self.cycle_op_xy_session_focus(&session_label, session_id);
+            }
+            OpXyControl::NoOp => unreachable!(),
+            control => {
+                let Some(window_id) = self.op_xy_window_for_session(&session_id) else {
                     self.set_status(format!(
-                        "OP-XY pane {} has no session for prompt {}",
-                        event.pane + 1,
-                        slot + 1
+                        "OP-XY session {} is not displayed in a split",
+                        session_label
                     ));
                     return;
                 };
-                self.set_scrollback_for_window(Some(window_id), 0);
-                let bytes = self.encode_paste_for_pty(&session_id, text);
-                self.queue_pty_input(session_id, bytes, "OP-XY prompt pty_input");
-                self.set_status(format!(
-                    "OP-XY pane {} inserted prompt {}",
-                    event.pane + 1,
-                    slot + 1
-                ));
-            }
-            OpXyControl::Enter => {
-                self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-                    .await;
-            }
-            control => {
-                let code = match control {
-                    OpXyControl::Left => KeyCode::Left,
-                    OpXyControl::Down => KeyCode::Down,
-                    OpXyControl::Right => KeyCode::Right,
-                    OpXyControl::Up => KeyCode::Up,
-                    OpXyControl::Session(_)
-                    | OpXyControl::Prompt { .. }
-                    | OpXyControl::Enter => unreachable!(),
-                };
-                self.on_key(KeyEvent::new(code, KeyModifiers::NONE)).await;
+                if self.focus != PaneFocus::View || self.active_window_id != window_id {
+                    self.focus_main_window(window_id);
+                }
+                self.select_session(session_id.clone());
+                match control {
+                    OpXyControl::Prompt { slot, text } => {
+                        self.set_scrollback_for_window(Some(window_id), 0);
+                        let bytes = self.encode_paste_for_pty(&session_id, text);
+                        self.queue_pty_input(session_id.clone(), bytes, "OP-XY prompt pty_input");
+                        self.set_status(format!(
+                            "OP-XY session {} inserted prompt {}",
+                            session_label,
+                            slot + 1
+                        ));
+                    }
+                    OpXyControl::Enter => {
+                        self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                            .await;
+                    }
+                    control => {
+                        let code = match control {
+                            OpXyControl::Left => KeyCode::Left,
+                            OpXyControl::Down => KeyCode::Down,
+                            OpXyControl::Right => KeyCode::Right,
+                            OpXyControl::Up => KeyCode::Up,
+                            OpXyControl::Escape => KeyCode::Esc,
+                            OpXyControl::Backspace => KeyCode::Backspace,
+                            OpXyControl::Split(_)
+                            | OpXyControl::CycleFocus
+                            | OpXyControl::NoOp
+                            | OpXyControl::Prompt { .. }
+                            | OpXyControl::Enter => unreachable!(),
+                        };
+                        self.on_key(KeyEvent::new(code, KeyModifiers::NONE)).await;
+                    }
+                }
             }
         }
     }
@@ -10799,13 +10879,21 @@ impl App {
         &mut self,
         control: crate::midi::OpXyControl,
     ) {
-        let Some(pane) = (0..4)
-            .find(|pane| self.op_xy_pane_window_id(*pane) == Some(self.active_window_id))
+        let Some(session_id) = self
+            .selection_for_window(self.active_window_id)
+            .and_then(|selection| selection.session_id().map(str::to_owned))
         else {
             self.set_status("OP-XY focused pane is not visible".into());
             return;
         };
-        self.handle_op_xy_event(crate::midi::OpXyEvent { pane, control })
+        let session = self
+            .resolved_op_xy_session_slots()
+            .iter()
+            .position(|slot| slot.as_deref() == Some(session_id.as_str()));
+        let label = session
+            .map(|session| (session + 1).to_string())
+            .unwrap_or_else(|| "focused".into());
+        self.handle_op_xy_control_for_session(session_id, label, control)
             .await;
     }
 
@@ -10884,21 +10972,12 @@ impl App {
     pub(crate) fn op_xy_feedback_snapshot(&self) -> crate::midi::FeedbackSnapshot {
         let slots = self.resolved_op_xy_session_slots();
         let (active_slots, attention_slots) = op_xy_slot_state_masks(&self.sessions, &slots);
-        let pane_sessions = (0..4)
-            .map(|pane| {
-                let window_id = self.op_xy_pane_window_id(pane)?;
-                self.selection_for_window(window_id)
-                    .and_then(|selection| selection.session_id().map(str::to_owned))
-            })
-            .collect::<Vec<_>>();
-        let (active_panes, attention_panes) =
-            op_xy_slot_state_masks(&self.sessions, &pane_sessions);
         crate::midi::FeedbackSnapshot {
             fleet: op_xy_slot_feedback_state(active_slots, attention_slots),
             active_slots,
             attention_slots,
-            active_panes: active_panes & 0b0000_1111,
-            attention_panes: attention_panes & 0b0000_1111,
+            active_tracks: active_slots & 0b0000_1111,
+            attention_tracks: attention_slots & 0b0000_1111,
         }
     }
 
@@ -13787,6 +13866,107 @@ mod tests {
         app.handle_op_xy_aux_control(crate::midi::OpXyAuxControl::ScrollUp)
             .await;
         assert_eq!(app.program_popup.as_ref().unwrap().scroll_offset, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn op_xy_session_channel_selects_split_and_cycles_split_list_lineage() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut root = summary_with_kind(construct_protocol::SessionKind::User);
+        root.id = "root".into();
+        root.title = Some("[1] root".into());
+        root.state = construct_protocol::SessionState::Done;
+        let mut child = summary_with_kind(construct_protocol::SessionKind::Subagent);
+        child.id = "child".into();
+        child.parent_session_id = Some(root.id.clone());
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
+        second.id = "second".into();
+        second.title = Some("[2] second".into());
+        second.state = construct_protocol::SessionState::Running;
+        app.sessions = vec![root, second, child];
+
+        let feedback = app.op_xy_feedback_snapshot();
+        assert_eq!(feedback.active_slots, 0b0000_0010);
+        assert_eq!(
+            feedback.active_tracks, 0b0000_0010,
+            "synth track 2 follows session [2] even before it is displayed"
+        );
+
+        let first_window = app.op_xy_pane_window_id(0).expect("first split");
+        app.handle_op_xy_event(crate::midi::OpXyEvent {
+            session: 0,
+            control: crate::midi::OpXyControl::Split(0),
+        })
+        .await;
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(app.active_window_id, first_window);
+        assert_eq!(
+            app.selection_for_window(first_window)
+                .and_then(|selection| selection.session_id().map(str::to_owned))
+                .as_deref(),
+            Some("root")
+        );
+
+        app.handle_op_xy_event(crate::midi::OpXyEvent {
+            session: 0,
+            control: crate::midi::OpXyControl::CycleFocus,
+        })
+        .await;
+        assert_eq!(app.focus, PaneFocus::List);
+        assert!(!app.lineage_focused);
+        assert_eq!(app.selected_id().as_deref(), Some("root"));
+
+        app.handle_op_xy_event(crate::midi::OpXyEvent {
+            session: 0,
+            control: crate::midi::OpXyControl::CycleFocus,
+        })
+        .await;
+        assert_eq!(app.focus, PaneFocus::List);
+        assert!(app.lineage_focused);
+
+        app.handle_op_xy_event(crate::midi::OpXyEvent {
+            session: 0,
+            control: crate::midi::OpXyControl::CycleFocus,
+        })
+        .await;
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(app.active_window_id, first_window);
+
+        app.focus = PaneFocus::List;
+        app.handle_op_xy_event(crate::midi::OpXyEvent {
+            session: 7,
+            control: crate::midi::OpXyControl::NoOp,
+        })
+        .await;
+        assert_eq!(
+            app.focus,
+            PaneFocus::List,
+            "display no-op does not require an assigned session or change focus"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn op_xy_aux_notes_still_control_an_unnumbered_focused_session() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
+        session.id = "plain".into();
+        session.title = Some("plain session".into());
+        app.sessions = vec![session];
+        app.select_session("plain".into());
+
+        app.handle_op_xy_focused_control(crate::midi::OpXyControl::Split(0))
+            .await;
+        let first_window = app.op_xy_pane_window_id(0).expect("first split");
+        assert_eq!(app.active_window_id, first_window);
+        assert_eq!(
+            app.selection_for_window(first_window)
+                .and_then(|selection| selection.session_id().map(str::to_owned))
+                .as_deref(),
+            Some("plain")
+        );
+
         server.abort();
     }
 
