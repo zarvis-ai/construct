@@ -78,7 +78,11 @@ async fn daemon_drop_reaps_shell_adapter_tree() {
     drop(d);
 
     assert!(!pid_alive(daemon_pid), "daemon survived harness drop");
-    let child_deadline = Instant::now() + Duration::from_secs(2);
+    // Generous budget: the adapter kills its child on shutdown (stop-before-
+    // drain), so the normal case completes in milliseconds — but on a loaded
+    // CI runner the adapter process may be scheduled late. The poll loop
+    // exits as soon as the child is gone.
+    let child_deadline = Instant::now() + Duration::from_secs(10);
     while pid_alive(shell_pid) && Instant::now() < child_deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

@@ -180,7 +180,15 @@ pub async fn run_session(spec: PtySpec, ctx: AdapterContext) -> i32 {
             }
             msg = inbox.recv(), if !inbox_closed => {
                 match msg {
-                    None => { inbox_closed = true; }
+                    None => {
+                        // Inbox closed = the adapter runtime is exiting. The
+                        // child would die anyway once process exit closes the
+                        // PTY master (SIGHUP), but only after the runtime's
+                        // session-drain timeout expires — kill it now so
+                        // teardown is prompt.
+                        inbox_closed = true;
+                        let _ = killer.kill();
+                    }
                     Some(AdapterInboxMsg::PtyInput(b)) => {
                         let _ = write_tx.send(b);
                     }
