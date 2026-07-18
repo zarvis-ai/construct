@@ -104,12 +104,13 @@ scroll_cc = 3
 
 The learned profile enables feedback by default. Construct treats OP-XY scene
 numbers as the one-based numbers shown on the device and aggregates the state
-of every session, independent of TUI focus. It sends immediate scene changes
-using CC 85:
+of the eight sessions assigned to `[1]`–`[8]`, independent of TUI focus. Hidden,
+archived, program, and unassigned sessions do not affect it. Construct sends
+immediate scene changes using CC 85:
 
-- Scene 2 with MIDI Start when any non-terminal session has the blue attention
-  dot. Attention takes precedence over ordinary activity.
-- Otherwise, Scene 1 with MIDI Start when any session is pending or running.
+- Scene 2 with MIDI Start when any assigned non-terminal session has the blue
+  attention dot. Attention takes precedence over ordinary activity.
+- Otherwise, Scene 1 with MIDI Start when any assigned session is pending or running.
 - Scene 1 with MIDI Stop when no session needs attention or is active.
 
 The OP-XY mixer provides an eight-session activity overview independently of

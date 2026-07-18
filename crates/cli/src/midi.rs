@@ -1468,7 +1468,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         let attention = FeedbackSnapshot {
-            fleet: FeedbackState::Working,
+            fleet: FeedbackState::Attention,
             active_slots: 0b0000_0001,
             attention_slots: 0b1000_0001,
             active_panes: 0b0000_0011,

@@ -4868,20 +4868,14 @@ fn op_xy_session_feedback_state(session: Option<&SessionSummary>) -> crate::midi
     }
 }
 
-fn op_xy_fleet_feedback_state(sessions: &[SessionSummary]) -> crate::midi::FeedbackState {
-    let mut aggregate = crate::midi::FeedbackState::Idle;
-    for session in sessions {
-        match op_xy_session_feedback_state(Some(session)) {
-            crate::midi::FeedbackState::Attention => {
-                return crate::midi::FeedbackState::Attention;
-            }
-            crate::midi::FeedbackState::Working => {
-                aggregate = crate::midi::FeedbackState::Working;
-            }
-            crate::midi::FeedbackState::Idle => {}
-        }
+fn op_xy_slot_feedback_state(active_slots: u8, attention_slots: u8) -> crate::midi::FeedbackState {
+    if attention_slots != 0 {
+        crate::midi::FeedbackState::Attention
+    } else if active_slots != 0 {
+        crate::midi::FeedbackState::Working
+    } else {
+        crate::midi::FeedbackState::Idle
     }
-    aggregate
 }
 
 fn op_xy_slot_state_masks(
@@ -10818,10 +10812,6 @@ impl App {
         }
     }
 
-    pub(crate) fn op_xy_feedback_state(&self) -> crate::midi::FeedbackState {
-        op_xy_fleet_feedback_state(&self.sessions)
-    }
-
     pub(crate) fn op_xy_feedback_snapshot(&self) -> crate::midi::FeedbackSnapshot {
         let slots = self.resolved_op_xy_session_slots();
         let (active_slots, attention_slots) = op_xy_slot_state_masks(&self.sessions, &slots);
@@ -10835,7 +10825,7 @@ impl App {
         let (active_panes, attention_panes) =
             op_xy_slot_state_masks(&self.sessions, &pane_sessions);
         crate::midi::FeedbackSnapshot {
-            fleet: self.op_xy_feedback_state(),
+            fleet: op_xy_slot_feedback_state(active_slots, attention_slots),
             active_slots,
             attention_slots,
             active_panes: active_panes & 0b0000_1111,
@@ -13628,25 +13618,17 @@ mod tests {
     }
 
     #[test]
-    fn op_xy_feedback_aggregates_all_sessions_with_attention_precedence() {
-        let mut idle = summary_with_kind(construct_protocol::SessionKind::User);
-        idle.state = construct_protocol::SessionState::Done;
-        let mut working = summary_with_kind(construct_protocol::SessionKind::User);
-        working.state = construct_protocol::SessionState::Running;
-        let mut attention = summary_with_kind(construct_protocol::SessionKind::User);
-        attention.state = construct_protocol::SessionState::AwaitingInput;
-        attention.needs_attention = true;
-
+    fn op_xy_feedback_aggregates_assigned_slots_with_attention_precedence() {
         assert_eq!(
-            op_xy_fleet_feedback_state(&[idle.clone()]),
+            op_xy_slot_feedback_state(0, 0),
             crate::midi::FeedbackState::Idle
         );
         assert_eq!(
-            op_xy_fleet_feedback_state(&[idle.clone(), working.clone()]),
+            op_xy_slot_feedback_state(0b0000_0100, 0),
             crate::midi::FeedbackState::Working
         );
         assert_eq!(
-            op_xy_fleet_feedback_state(&[idle, working, attention]),
+            op_xy_slot_feedback_state(0b0000_0100, 0b1000_0000),
             crate::midi::FeedbackState::Attention
         );
     }

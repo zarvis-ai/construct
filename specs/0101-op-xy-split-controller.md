@@ -27,10 +27,12 @@ without submitting it. Empty or missing prompt slots do nothing. Their notes
 are derived from the learned first-black-key anchor and normalized across pane
 track octaves, so adding prompts does not require relearning the controller.
 
-Scene and transport feedback aggregate every session independently of TUI
-focus. If any non-terminal session needs attention, Scene 2 runs and takes
-precedence over ordinary activity. Otherwise, if any session is pending or
-running, Scene 1 runs. When neither condition exists, Scene 1 is stopped.
+Scene and transport feedback aggregate the eight sessions resolved into
+`[1]`–`[8]` hardware slots independently of TUI focus. Hidden, archived,
+program, and unassigned sessions do not contribute. If any assigned
+non-terminal session needs attention, Scene 2 runs and takes precedence over
+ordinary activity. Otherwise, if any assigned session is pending or running,
+Scene 1 runs. When neither condition exists, Scene 1 is stopped.
 Terminal state takes precedence over a stale attention marker on that session.
 Construct supplies MIDI real-time Start/Stop while OP-XY retains its internal
 clock. Session-state and attention-marker changes update feedback as part of
