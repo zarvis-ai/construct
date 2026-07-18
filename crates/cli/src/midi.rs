@@ -190,10 +190,51 @@ fn default_op_xy_aux_focused_note_channels() -> Vec<u8> {
     vec![10]
 }
 
+fn default_op_xy_navigation_channels() -> Vec<u8> {
+    (1..=8).chain(std::iter::once(10)).collect()
+}
+
+const fn default_op_xy_bank_cc() -> u8 {
+    0
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OpXyAuxState {
     arrow_value: Option<u8>,
     scroll_value: Option<u8>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OpXyNavigationState {
+    bank_values: [Option<u8>; 16],
+    program_values: [Option<u8>; 16],
+}
+
+impl OpXyNavigationState {
+    fn event_for(&mut self, config: &OpXyConfig, message: &MidiMessage) -> Option<OpXyAuxControl> {
+        if !config.enabled || !config.navigation_channels.contains(&message.channel) {
+            return None;
+        }
+        let channel = usize::from(message.channel.checked_sub(1)?);
+        let (previous, increasing, decreasing) = match message.kind {
+            MidiMessageKind::Cc if message.number == config.bank_cc => (
+                &mut self.bank_values[channel],
+                OpXyAuxControl::Down,
+                OpXyAuxControl::Up,
+            ),
+            MidiMessageKind::ProgramChange => (
+                &mut self.program_values[channel],
+                OpXyAuxControl::ScrollDown,
+                OpXyAuxControl::ScrollUp,
+            ),
+            _ => return None,
+        };
+        let old = previous.replace(message.value)?;
+        absolute_encoder_direction(old, message.value).map(|direction| match direction {
+            EncoderDirection::Increase => increasing,
+            EncoderDirection::Decrease => decreasing,
+        })
+    }
 }
 
 impl OpXyAuxState {
@@ -273,6 +314,12 @@ pub struct OpXyConfig {
     /// Legacy white-key no-op retained only for old profile compatibility.
     /// New profiles reserve black key 7 instead.
     pub no_op_note: Option<u8>,
+    /// Track channels whose Bank Select and Program Change values navigate the TUI.
+    #[serde(default = "default_op_xy_navigation_channels")]
+    pub navigation_channels: Vec<u8>,
+    /// Absolute Bank Select CC used for Up/Down navigation.
+    #[serde(default = "default_op_xy_bank_cc")]
+    pub bank_cc: u8,
     pub aux: OpXyAuxConfig,
     pub feedback: OpXyFeedbackConfig,
 }
@@ -485,6 +532,7 @@ impl fmt::Display for MidiTrigger {
 pub enum MidiMessageKind {
     Note,
     Cc,
+    ProgramChange,
 }
 
 impl fmt::Display for MidiMessageKind {
@@ -492,6 +540,7 @@ impl fmt::Display for MidiMessageKind {
         match self {
             Self::Note => f.write_str("note"),
             Self::Cc => f.write_str("cc"),
+            Self::ProgramChange => f.write_str("program-change"),
         }
     }
 }
@@ -604,6 +653,7 @@ pub(crate) fn start_listener() -> Result<Option<(MidiListener, MidiEventReceiver
     let mappings = config.mappings;
     let op_xy = config.op_xy;
     let mut op_xy_aux_state = OpXyAuxState::default();
+    let mut op_xy_navigation_state = OpXyNavigationState::default();
     let (tx, rx) = mpsc::unbounded_channel();
     let connection = input
         .connect(
@@ -633,6 +683,13 @@ pub(crate) fn start_listener() -> Result<Option<(MidiListener, MidiEventReceiver
                         .then(|| op_xy_aux_state.event_for(&profile.aux, &message))
                         .flatten()
                 }) {
+                    let _ = tx.send(MidiInputEvent::OpXyAux(event));
+                    return;
+                }
+                if let Some(event) = op_xy
+                    .as_ref()
+                    .and_then(|profile| op_xy_navigation_state.event_for(profile, &message))
+                {
                     let _ = tx.send(MidiInputEvent::OpXyAux(event));
                     return;
                 }
@@ -848,6 +905,8 @@ fn op_xy_learn(requested_device: Option<&str>) -> Result<()> {
         up_note: Some(up_note),
         enter_note: Some(enter_note),
         no_op_note: None,
+        navigation_channels: default_op_xy_navigation_channels(),
+        bank_cc: default_op_xy_bank_cc(),
         aux: OpXyAuxConfig::default(),
         feedback: OpXyFeedbackConfig::default(),
     });
@@ -1303,34 +1362,46 @@ fn find_output_port(output: &MidiOutput, selector: &str) -> Result<MidiOutputPor
 
 fn parse_message(bytes: &[u8]) -> Option<MidiMessage> {
     let (&status, data) = bytes.split_first()?;
-    if status < 0x80 || data.len() < 2 {
+    if status < 0x80 {
         return None;
     }
     let channel = (status & 0x0f) + 1;
-    let number = data[0] & 0x7f;
-    let value = data[1] & 0x7f;
     match status & 0xf0 {
         0x80 => Some(MidiMessage {
             kind: MidiMessageKind::Note,
             channel,
-            number,
-            value,
+            number: *data.first()? & 0x7f,
+            value: *data.get(1)? & 0x7f,
             pressed: false,
         }),
-        0x90 => Some(MidiMessage {
-            kind: MidiMessageKind::Note,
-            channel,
-            number,
-            value,
-            pressed: value != 0,
-        }),
+        0x90 => {
+            let number = *data.first()? & 0x7f;
+            let value = *data.get(1)? & 0x7f;
+            Some(MidiMessage {
+                kind: MidiMessageKind::Note,
+                channel,
+                number,
+                value,
+                pressed: value != 0,
+            })
+        }
         0xb0 => Some(MidiMessage {
             kind: MidiMessageKind::Cc,
             channel,
-            number,
-            value,
-            pressed: value >= 64,
+            number: *data.first()? & 0x7f,
+            value: *data.get(1)? & 0x7f,
+            pressed: (*data.get(1)? & 0x7f) >= 64,
         }),
+        0xc0 => {
+            let program = *data.first()? & 0x7f;
+            Some(MidiMessage {
+                kind: MidiMessageKind::ProgramChange,
+                channel,
+                number: program,
+                value: program,
+                pressed: false,
+            })
+        }
         _ => None,
     }
 }
@@ -1342,6 +1413,7 @@ fn infer_trigger(message: &MidiMessage) -> MidiTrigger {
         MidiMessageKind::Cc if (1..=63).contains(&message.value) => MidiTrigger::Increase,
         MidiMessageKind::Cc if (65..=127).contains(&message.value) => MidiTrigger::Decrease,
         MidiMessageKind::Cc => MidiTrigger::Any,
+        MidiMessageKind::ProgramChange => MidiTrigger::Any,
     }
 }
 
@@ -1367,10 +1439,14 @@ mod tests {
     }
 
     #[test]
-    fn ignores_clock_program_change_and_short_messages() {
+    fn parses_program_change_and_ignores_clock_and_short_messages() {
         assert!(parse_message(&[0xf8]).is_none());
-        assert!(parse_message(&[0xc0, 2]).is_none());
+        let program = parse_message(&[0xc4, 2]).unwrap();
+        assert_eq!(program.kind, MidiMessageKind::ProgramChange);
+        assert_eq!(program.channel, 5);
+        assert_eq!(program.value, 2);
         assert!(parse_message(&[]).is_none());
+        assert!(parse_message(&[0x90, 60]).is_none());
     }
 
     #[test]
@@ -1443,12 +1519,95 @@ mod tests {
     }
 
     #[test]
+    fn op_xy_bank_and_program_changes_navigate_per_channel_after_calibration() {
+        let config = op_xy_profile();
+        let mut state = OpXyNavigationState::default();
+
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xb0, 0, 4]).unwrap()),
+            None
+        );
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xb0, 0, 5]).unwrap()),
+            Some(OpXyAuxControl::Down)
+        );
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xb0, 0, 3]).unwrap()),
+            Some(OpXyAuxControl::Up)
+        );
+
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xc0, 8]).unwrap()),
+            None
+        );
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xc0, 9]).unwrap()),
+            Some(OpXyAuxControl::ScrollDown)
+        );
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xc0, 7]).unwrap()),
+            Some(OpXyAuxControl::ScrollUp)
+        );
+
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xb1, 0, 50]).unwrap()),
+            None,
+            "channel 2 has an independent bank baseline"
+        );
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xc1, 50]).unwrap()),
+            None,
+            "channel 2 has an independent program baseline"
+        );
+    }
+
+    #[test]
+    fn op_xy_bank_and_program_navigation_accepts_channels_one_through_eight_and_ten() {
+        let config = op_xy_profile();
+        let mut state = OpXyNavigationState::default();
+
+        assert!(state
+            .event_for(&config, &parse_message(&[0xb8, 0, 1]).unwrap())
+            .is_none());
+        assert!(state
+            .event_for(&config, &parse_message(&[0xb8, 0, 2]).unwrap())
+            .is_none());
+        assert!(state
+            .event_for(&config, &parse_message(&[0xc8, 1]).unwrap())
+            .is_none());
+        assert!(state
+            .event_for(&config, &parse_message(&[0xc8, 2]).unwrap())
+            .is_none());
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xb9, 0, 1]).unwrap()),
+            None
+        );
+        assert_eq!(
+            state.event_for(&config, &parse_message(&[0xb9, 0, 2]).unwrap()),
+            Some(OpXyAuxControl::Down)
+        );
+    }
+
+    #[test]
     fn op_xy_aux_existing_config_defaults_external_midi_note_channel() {
         let config: OpXyAuxConfig = toml::from_str(
             "enabled = true\nchannel = 10\narrow_cc = 2\nscroll_cc = 3\n",
         )
         .unwrap();
         assert_eq!(config.focused_note_channels, vec![10]);
+    }
+
+    #[test]
+    fn op_xy_existing_config_defaults_bank_and_program_navigation_channels() {
+        let profile: OpXyConfig = toml::from_str(
+            "enabled = true\nsession_channels = [1]\ntrack_anchor_notes = [54]\nblack_notes = [54]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            profile.navigation_channels,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 10]
+        );
+        assert_eq!(profile.bank_cc, 0);
     }
 
     #[test]
@@ -1525,6 +1684,8 @@ mod tests {
                 up_note: Some(73),
                 enter_note: Some(75),
                 no_op_note: Some(71),
+                navigation_channels: default_op_xy_navigation_channels(),
+                bank_cc: default_op_xy_bank_cc(),
                 aux: OpXyAuxConfig::default(),
                 feedback: OpXyFeedbackConfig::default(),
             }),
@@ -1634,6 +1795,8 @@ mod tests {
             up_note: Some(68),
             enter_note: Some(70),
             no_op_note: Some(65),
+            navigation_channels: default_op_xy_navigation_channels(),
+            bank_cc: default_op_xy_bank_cc(),
             aux: OpXyAuxConfig::default(),
             feedback: OpXyFeedbackConfig::default(),
         }

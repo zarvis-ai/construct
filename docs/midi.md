@@ -113,7 +113,23 @@ scroll down and decreasing values move or scroll up. The scroll encoder follows
 TUI focus: it scrolls the session list, focused lineage diagram, program
 document, dynamic panel, help, chat, or terminal history rather than always
 targeting the session pane. Crossing between 127 and 0 preserves the physical
-direction. CC 0 and CC 1 are currently unassigned.
+direction.
+
+On every session track (MIDI channels 1–8) and Auxiliary 3 (channel 10), the
+OP-XY Bank value also sends Up/Down and the Program value sends focused-surface
+scroll up/down. These values are absolute and independently calibrated per
+channel and control: the first Bank and first Program message received on each
+channel establish baselines without acting. Increasing Bank or Program moves
+or scrolls down; decreasing values move or scroll up. This lets the same two
+track-menu controls navigate Construct regardless of which track is selected.
+
+The participating channels and Bank Select CC can be changed under `[op_xy]`:
+
+```toml
+[op_xy]
+navigation_channels = [1, 2, 3, 4, 5, 6, 7, 8, 10]
+bank_cc = 0
+```
 
 The defaults can be changed in `midi.toml`:
 
