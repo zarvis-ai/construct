@@ -97,10 +97,12 @@ env = { CONSTRUCT_CODEX_CMD = "exec codex" }
 | `claude` | `CONSTRUCT_CLAUDE_CMD` | `CONSTRUCT_CLAUDE_BIN` |
 | `antigravity` | `CONSTRUCT_ANTIGRAVITY_CMD` | `CONSTRUCT_ANTIGRAVITY_BIN` |
 | `grok` | `CONSTRUCT_GROK_CMD` | `CONSTRUCT_GROK_BIN` |
+| `kimi` | `CONSTRUCT_KIMI_CMD` | `CONSTRUCT_KIMI_BIN` |
 | `shell` | `CONSTRUCT_SHELL_CMD` | `CONSTRUCT_SHELL_BIN` |
 
 OpenCode discovery checks `opencode` on the daemon's `PATH`, then the standard
-installer location at `~/.opencode/bin/opencode`. The explicit command and
+installer location at `~/.opencode/bin/opencode`. Kimi Code discovery likewise
+checks `kimi` on `PATH`, then `~/.kimi-code/bin/kimi`. The explicit command and
 binary overrides above take precedence over both.
 
 ## TUI Theme

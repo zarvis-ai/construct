@@ -60,6 +60,10 @@ pub fn harness_guidance(name: &str) -> String {
         "grok" => "install the `grok` CLI; it must be on the PATH of the shell that starts the \
                     construct daemon"
             .to_string(),
+        "kimi" => "install the `kimi` CLI (Kimi Code) and run `kimi login`; it must be on the \
+                    PATH of the shell that starts the construct daemon (or installed at \
+                    ~/.kimi-code/bin/kimi, or set CONSTRUCT_KIMI_BIN)"
+            .to_string(),
         "shell" => "nothing needed — always available".to_string(),
         "smith" => "see the Smith auth tab (→) for the auth methods smith supports and their \
                      live status"

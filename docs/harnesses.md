@@ -19,6 +19,7 @@ review it, and use smith as the built-in coordinator.
 | `codex` | The Codex CLI | You already use Codex and want it inside the same construct UI and session fleet. |
 | `opencode` | The OpenCode CLI | You already use OpenCode and want its native TUI inside the same construct session fleet. |
 | `antigravity` | The Antigravity CLI | You want Antigravity sessions inside the same UI and daemon. |
+| `kimi` | The Kimi Code CLI | You already use Kimi Code and want its native TUI inside the same construct session fleet. |
 
 Create a session with:
 
@@ -27,6 +28,7 @@ construct new smith "review this repo"
 construct new shell
 construct new codex "implement the failing test"
 construct new opencode "implement the failing test"
+construct new kimi "implement the failing test"
 ```
 
 By default, `construct new ...` creates an interactive session and opens the TUI
@@ -80,7 +82,7 @@ See [smith built-in agent](smith.md) for details.
 
 ### CLI-backed harnesses
 
-`claude`, `codex`, `opencode`, and `antigravity` wrap existing CLIs. Use them when you want
+`claude`, `codex`, `opencode`, `antigravity`, `grok`, and `kimi` wrap existing CLIs. Use them when you want
 those tools exactly as installed on your machine, but inside the same construct
 fleet.
 
@@ -131,8 +133,8 @@ construct new --no-tui claude
 construct new smith --mode headless "summarize the last run"
 ```
 
-`smith`, `claude`, `codex`, and `antigravity` support both modes. `opencode` is
-interactive-only and always runs its native TUI. `shell` always
+`smith`, `claude`, `codex`, and `antigravity` support both modes. `opencode` and
+`kimi` are interactive-only and always run their native TUIs. `shell` always
 owns a PTY (there is no structured "headless" shell), so it presents a terminal
 regardless of the mode label.
 
@@ -157,8 +159,8 @@ You normally do not need these, but they are useful for scripting and debugging:
 | --- | --- |
 | `--mode interactive\|headless` | Choose the session mode at creation time. |
 | `CONSTRUCT_SMITH_MODE`, `CONSTRUCT_CLAUDE_MODE`, `CONSTRUCT_CODEX_MODE`, `CONSTRUCT_ANTIGRAVITY_MODE` | Default mode per harness. |
-| `CONSTRUCT_CLAUDE_CMD`, `CONSTRUCT_CODEX_CMD`, `CONSTRUCT_OPENCODE_CMD`, `CONSTRUCT_ANTIGRAVITY_CMD`, `CONSTRUCT_SHELL_CMD` | Override the full command used for a CLI-backed harness or shell. |
-| `CONSTRUCT_CLAUDE_BIN`, `CONSTRUCT_CODEX_BIN`, `CONSTRUCT_OPENCODE_BIN`, `CONSTRUCT_ANTIGRAVITY_BIN`, `CONSTRUCT_SHELL_BIN` | Override just the binary path when no full command override is set. |
+| `CONSTRUCT_CLAUDE_CMD`, `CONSTRUCT_CODEX_CMD`, `CONSTRUCT_OPENCODE_CMD`, `CONSTRUCT_ANTIGRAVITY_CMD`, `CONSTRUCT_KIMI_CMD`, `CONSTRUCT_SHELL_CMD` | Override the full command used for a CLI-backed harness or shell. |
+| `CONSTRUCT_CLAUDE_BIN`, `CONSTRUCT_CODEX_BIN`, `CONSTRUCT_OPENCODE_BIN`, `CONSTRUCT_ANTIGRAVITY_BIN`, `CONSTRUCT_KIMI_BIN`, `CONSTRUCT_SHELL_BIN` | Override just the binary path when no full command override is set. |
 | `CONSTRUCT_SMITH_MODEL` | Default model for the built-in smith harness. |
 | `CONSTRUCT_AUTO_APPROVE_PATHS` | Path allow-list injected into adapters that can translate it. |
 | `CONSTRUCT_SESSION_WIDGETS_DIR` | Directory where a session writes Markdown widgets. |

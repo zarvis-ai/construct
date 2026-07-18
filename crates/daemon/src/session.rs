@@ -2155,6 +2155,14 @@ impl SessionManager {
                 "agy",
             ),
             "grok" => probe_wrapper_cli("CONSTRUCT_GROK_CMD", "CONSTRUCT_GROK_BIN", "grok"),
+            "kimi" => probe_wrapper_cli(
+                "CONSTRUCT_KIMI_CMD",
+                "CONSTRUCT_KIMI_BIN",
+                &construct_protocol::adapter::default_cli_bin_with_home_fallback(
+                    "kimi",
+                    std::path::Path::new(".kimi-code/bin/kimi"),
+                ),
+            ),
             "smith" => probe_smith(&self.availability_cache).await,
             _ => probe_generic_adapter(binary_spec, resolved_binary),
         }
@@ -4354,6 +4362,7 @@ impl SessionManager {
             "codex" => Some("codex_session_id.txt"),
             "opencode" => Some("opencode_session_id.txt"),
             "grok" => Some("grok_session_id.txt"),
+            "kimi" => Some("kimi_session_id.txt"),
             _ => None,
         }
     }
@@ -4809,7 +4818,7 @@ fn effective_mode(params: &CreateSessionParams) -> String {
 
 fn builtin_harness_capabilities(name: &str) -> construct_protocol::Capabilities {
     match name {
-        "shell" | "claude" | "codex" | "opencode" | "antigravity" | "agy" | "grok"
+        "shell" | "claude" | "codex" | "opencode" | "antigravity" | "agy" | "grok" | "kimi"
         | "smith" => {
             construct_protocol::Capabilities {
                 supports_pty: true,
@@ -8155,6 +8164,7 @@ mod tests {
             "antigravity",
             "agy",
             "grok",
+            "kimi",
             "smith",
         ] {
             assert!(

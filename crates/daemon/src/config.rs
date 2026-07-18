@@ -25,7 +25,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # Active config:  ~/.config/construct/config.toml  (or $CONSTRUCT_CONFIG_DIR/config.toml)
 # This template:  ~/.config/construct/config.toml.template
 #
-# All built-in adapters (shell, claude, codex, opencode, antigravity, grok, smith) are
+# All built-in adapters (shell, claude, codex, opencode, antigravity, grok, kimi, smith) are
 # registered automatically — you do not need to declare them unless you want
 # to change a field.
 
@@ -42,6 +42,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 #   opencode    — OpenCode (wraps the `opencode` CLI)
 #   antigravity — Google Antigravity (wraps the `agy` CLI)
 #   grok        — Grok CLI (wraps the `grok` CLI)
+#   kimi        — Kimi Code (wraps the `kimi` CLI)
 #   smith       — native multi-provider agent (OpenAI / Anthropic / Gemini / Meta / Ollama / Grok)
 
 # [adapters.shell]
@@ -112,7 +113,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # the adapter's generated arguments. Wins over the binary-only CONSTRUCT_*_BIN.
 #
 # [adapters.codex.env]
-# CONSTRUCT_CODEX_CMD = "exec codex"        # also: CONSTRUCT_CLAUDE_CMD, CONSTRUCT_OPENCODE_CMD, CONSTRUCT_SHELL_CMD, CONSTRUCT_ANTIGRAVITY_CMD, CONSTRUCT_GROK_CMD
+# CONSTRUCT_CODEX_CMD = "exec codex"        # also: CONSTRUCT_CLAUDE_CMD, CONSTRUCT_OPENCODE_CMD, CONSTRUCT_SHELL_CMD, CONSTRUCT_ANTIGRAVITY_CMD, CONSTRUCT_GROK_CMD, CONSTRUCT_KIMI_CMD
 
 # Usage-probe command ────────────────────────────────────────────────────────
 #
@@ -279,12 +280,14 @@ enabled = true
 #   CONSTRUCT_CODEX_CMD       — command prefix for the codex adapter
 #   CONSTRUCT_ANTIGRAVITY_CMD — command prefix for the antigravity adapter
 #   CONSTRUCT_GROK_CMD        — command prefix for the grok adapter
+#   CONSTRUCT_KIMI_CMD        — command prefix for the kimi adapter
 #   CONSTRUCT_SHELL_CMD       — command prefix for the shell adapter
 #   CONSTRUCT_CLAUDE_BIN      — binary path fallback for the claude adapter
 #   CONSTRUCT_CODEX_BIN       — binary path fallback for the codex adapter
 #   CONSTRUCT_OPENCODE_BIN    — binary path fallback for the opencode adapter
 #   CONSTRUCT_ANTIGRAVITY_BIN — binary path fallback for the antigravity adapter
 #   CONSTRUCT_GROK_BIN        — binary path fallback for the grok adapter
+#   CONSTRUCT_KIMI_BIN        — binary path fallback for the kimi adapter
 "#;
 
 /// Kept for backwards-compat: `construct daemon default-config` and any
@@ -524,6 +527,12 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
         binary: "construct",
         args: &["__adapter", "grok"],
         description: "Grok CLI (wraps the `grok` CLI)",
+    },
+    BuiltinAdapter {
+        name: "kimi",
+        binary: "construct",
+        args: &["__adapter", "kimi"],
+        description: "Kimi Code (wraps the `kimi` CLI)",
     },
     BuiltinAdapter {
         name: "smith",
@@ -791,6 +800,16 @@ mod tests {
         // No built-in default and no override -> disabled.
         assert_eq!(cfg.effective_usage_probe("shell"), None);
         assert_eq!(cfg.effective_usage_probe("smith"), None);
+    }
+
+    #[test]
+    fn kimi_is_registered_as_a_builtin_wrapper() {
+        let adapter = BUILTIN_ADAPTERS
+            .iter()
+            .find(|adapter| adapter.name == "kimi")
+            .expect("kimi builtin");
+        assert_eq!(adapter.binary, "construct");
+        assert_eq!(adapter.args, &["__adapter", "kimi"]);
     }
 
     #[test]

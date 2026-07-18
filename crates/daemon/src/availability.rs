@@ -1,6 +1,6 @@
 //! Real per-harness availability probing (spec 0068).
 //!
-//! Every built-in wrapper adapter (claude, codex, opencode, agy, grok)
+//! Every built-in wrapper adapter (claude, codex, opencode, agy, grok, kimi)
 //! declares `binary = "construct"` — the agentd wrapper itself, which is
 //! always the currently-running binary, so it always resolves. Checking
 //! *that* binary told a user nothing about whether the CLI it wraps (or a

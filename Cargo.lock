@@ -645,6 +645,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "construct-adapter-kimi"
+version = "0.14.7"
+dependencies = [
+ "anyhow",
+ "construct-protocol",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "construct-adapter-opencode"
 version = "0.14.7"
 dependencies = [
@@ -707,6 +718,7 @@ dependencies = [
  "construct-adapter-claude",
  "construct-adapter-codex",
  "construct-adapter-grok",
+ "construct-adapter-kimi",
  "construct-adapter-opencode",
  "construct-adapter-shell",
  "construct-adapter-smith",

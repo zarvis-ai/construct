@@ -36,6 +36,7 @@ Everything ships as **one binary**: `construct` runs the TUI by default, the dae
 | `crates/adapter-codex` | — (lib, via `construct __adapter codex`) | Wraps the `codex` CLI |
 | `crates/adapter-opencode` | — (lib, via `construct __adapter opencode`) | Wraps the `opencode` CLI |
 | `crates/adapter-antigravity` | — (lib, via `construct __adapter antigravity`) | Wraps the `agy` CLI |
+| `crates/adapter-kimi` | — (lib, via `construct __adapter kimi`) | Wraps the `kimi` CLI (Kimi Code) |
 | `crates/adapter-smith` | — (lib, via `construct __adapter smith`) | Built-in multi-provider agent (OpenAI / Anthropic / Gemini / Meta / Grok / Ollama) |
 | `crates/mcp` | — (lib, via `construct __mcp`) | MCP stdio server for agents running inside sessions |
 

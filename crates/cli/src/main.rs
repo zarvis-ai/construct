@@ -332,6 +332,8 @@ enum AdapterCommand {
     #[command(hide = true)]
     Grok,
     #[command(hide = true)]
+    Kimi,
+    #[command(hide = true)]
     Smith {
         /// Auto-title mode: generate a short title for the given prompt.
         #[arg(long)]
@@ -722,6 +724,10 @@ async fn main() -> Result<()> {
             }
             AdapterCommand::Grok => {
                 construct_adapter_grok::run().await?;
+                Ok(())
+            }
+            AdapterCommand::Kimi => {
+                construct_adapter_kimi::run().await?;
                 Ok(())
             }
             AdapterCommand::Smith {
