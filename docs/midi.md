@@ -82,13 +82,23 @@ Existing learned profiles do not need to be relearned. Construct derives the
 six white-key notes from the profile's first-black-key anchor and applies the
 same per-track octave normalization used by the session keys.
 
-Auxiliary track 3 can provide focus-sensitive generic controls on MIDI channel
-10. Its third encoder (CC 2) sends Up/Down, and its fourth encoder (CC 3) sends
-scroll up/down. Because OP-XY reports absolute values, Construct uses the first
-value received from each encoder only to establish its position. Later changes
-produce one action per MIDI message; increasing values move or scroll down and
-decreasing values move or scroll up. Crossing between 127 and 0 preserves the
-physical direction. CC 0 and CC 1 are currently unassigned.
+Auxiliary track 3 can send the same black- and white-key controls as the four
+pane tracks on MIDI channel 10. Instead of addressing a pane by track, these
+notes act on the currently focused split pane. Session selection, custom
+prompts, arrows, Enter, and the reserved no-op retain the learned profile's note
+meanings. Keep Aux 3 at the same note octave as the learned reference track.
+
+Auxiliary track 2 is OP-XY's internal Punch-In FX track. Its keys and encoders
+control that effect engine and do not produce external MIDI for Construct to
+receive, so it cannot provide this focused-pane control path.
+
+Auxiliary track 3 also provides focus-sensitive generic encoder controls on
+MIDI channel 10. Its third encoder (CC 2) sends Up/Down, and its fourth encoder
+(CC 3) sends scroll up/down. Because OP-XY reports absolute values, Construct
+uses the first value received from each encoder only to establish its position.
+Later changes produce one action per MIDI message; increasing values move or
+scroll down and decreasing values move or scroll up. Crossing between 127 and
+0 preserves the physical direction. CC 0 and CC 1 are currently unassigned.
 
 The defaults can be changed in `midi.toml`:
 
@@ -96,6 +106,7 @@ The defaults can be changed in `midi.toml`:
 [op_xy.aux]
 enabled = true
 channel = 10
+focused_note_channels = [10]
 arrow_cc = 2
 scroll_cc = 3
 ```

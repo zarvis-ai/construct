@@ -4523,6 +4523,9 @@ async fn run_loop(
                     Some(crate::midi::MidiInputEvent::OpXy(event)) => {
                         app.handle_op_xy_event(event).await;
                     }
+                    Some(crate::midi::MidiInputEvent::OpXyFocused(control)) => {
+                        app.handle_op_xy_focused_control(control).await;
+                    }
                     Some(crate::midi::MidiInputEvent::OpXyAux(control)) => {
                         app.handle_op_xy_aux_control(control).await;
                     }
@@ -10790,6 +10793,20 @@ impl App {
                 self.on_key(KeyEvent::new(code, KeyModifiers::NONE)).await;
             }
         }
+    }
+
+    pub(crate) async fn handle_op_xy_focused_control(
+        &mut self,
+        control: crate::midi::OpXyControl,
+    ) {
+        let Some(pane) = (0..4)
+            .find(|pane| self.op_xy_pane_window_id(*pane) == Some(self.active_window_id))
+        else {
+            self.set_status("OP-XY focused pane is not visible".into());
+            return;
+        };
+        self.handle_op_xy_event(crate::midi::OpXyEvent { pane, control })
+            .await;
     }
 
     pub(crate) async fn handle_op_xy_aux_control(
