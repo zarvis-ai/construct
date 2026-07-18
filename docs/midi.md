@@ -147,18 +147,20 @@ scroll_cc = 3
 ### Scene feedback
 
 The learned profile enables feedback by default. Construct treats OP-XY scene
-numbers as the one-based numbers shown on the device and aggregates the state
-of the eight sessions assigned to `[1]`–`[8]`, independent of TUI focus. Hidden,
-archived, program, and unassigned sessions do not affect it. Construct sends
-immediate scene changes using CC 85. Scene and transport encode attention and
-activity independently:
+numbers as the one-based numbers shown on the device. By default,
+`aggregate_scope = "all"` uses the same session scope as Matrix Rain intensity:
+every non-archived user session, including sessions without a `[N]` mapping.
+Set it to `"mapped"` to aggregate only the eight sessions assigned to
+`[1]`–`[8]`, independent of TUI focus. Subagents and orchestrator/system
+sessions do not contribute. Construct sends immediate scene changes using CC
+85. Scene and transport encode attention and activity independently:
 
-- Scene 1 with MIDI Stop when no assigned session is active or needs attention.
-- Scene 1 with MIDI Start when one or more assigned sessions are pending or running
+- Scene 1 with MIDI Stop when no included session is active or needs attention.
+- Scene 1 with MIDI Start when one or more included sessions are pending or running
   and none needs attention.
-- Scene 2 with MIDI Start when one or more assigned sessions are pending or running
+- Scene 2 with MIDI Start when one or more included sessions are pending or running
   and one or more needs attention.
-- Scene 2 with MIDI Stop when one or more assigned sessions need attention but none
+- Scene 2 with MIDI Stop when one or more included sessions need attention but none
   is pending or running.
 
 The OP-XY mixer provides an eight-session activity overview independently of
@@ -193,6 +195,7 @@ Scene defaults can be edited in `midi.toml`:
 ```toml
 [op_xy.feedback]
 enabled = true
+aggregate_scope = "all" # or "mapped"
 normal_scene = 1
 attention_scene = 2
 track_activity_cc = 12
@@ -200,6 +203,8 @@ track_activity_cc = 12
 
 `track_activity_cc` is the first of four consecutive parameter CCs. The legacy
 name `split_activity_cc` is still accepted when reading an existing profile.
+`aggregate_scope` changes only scene and transport feedback; mixer volumes and
+synth parameters always represent the mapped `[1]`–`[8]` slots.
 
 Scenes store track volume and mute state, so the Construct template should use
 identical volume/mute settings in every feedback scene. Disable MIDI echo on

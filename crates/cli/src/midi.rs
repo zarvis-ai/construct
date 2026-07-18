@@ -140,6 +140,8 @@ impl Default for FeedbackSnapshot {
 #[serde(default)]
 pub struct OpXyFeedbackConfig {
     pub enabled: bool,
+    /// Sessions included in aggregate scene and transport feedback.
+    pub aggregate_scope: OpXyAggregateScope,
     /// Scene numbers are written as the one-based numbers shown by OP-XY.
     pub normal_scene: u8,
     pub attention_scene: u8,
@@ -152,11 +154,20 @@ impl Default for OpXyFeedbackConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            aggregate_scope: OpXyAggregateScope::All,
             normal_scene: 1,
             attention_scene: 2,
             track_activity_cc: 12,
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpXyAggregateScope {
+    Mapped,
+    #[default]
+    All,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -925,6 +936,7 @@ fn op_xy_learn(_requested_device: Option<&str>) -> Result<()> {
 pub(crate) struct MidiFeedback {
     tx: std_mpsc::Sender<FeedbackSnapshot>,
     last_snapshot: std::cell::Cell<FeedbackSnapshot>,
+    aggregate_scope: OpXyAggregateScope,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -932,6 +944,10 @@ pub(crate) struct MidiFeedback;
 
 #[cfg(target_os = "macos")]
 impl MidiFeedback {
+    pub(crate) fn aggregate_scope(&self) -> OpXyAggregateScope {
+        self.aggregate_scope
+    }
+
     pub(crate) fn update(&self, snapshot: FeedbackSnapshot) {
         if self.last_snapshot.replace(snapshot) != snapshot {
             let _ = self.tx.send(snapshot);
@@ -941,6 +957,10 @@ impl MidiFeedback {
 
 #[cfg(not(target_os = "macos"))]
 impl MidiFeedback {
+    pub(crate) fn aggregate_scope(&self) -> OpXyAggregateScope {
+        OpXyAggregateScope::Mapped
+    }
+
     pub(crate) fn update(&self, _snapshot: FeedbackSnapshot) {}
 }
 
@@ -955,6 +975,7 @@ pub(crate) fn start_feedback() -> Result<Option<MidiFeedback>> {
     let output = MidiOutput::new("construct-op-xy-feedback").context("initialize MIDI output")?;
     let port = find_output_port(&output, device)?;
     let port_name = output.port_name(&port).context("read MIDI output name")?;
+    let aggregate_scope = profile.feedback.aggregate_scope;
     let connection = output
         .connect(&port, "construct-op-xy-feedback")
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -967,6 +988,7 @@ pub(crate) fn start_feedback() -> Result<Option<MidiFeedback>> {
     Ok(Some(MidiFeedback {
         tx,
         last_snapshot: std::cell::Cell::new(FeedbackSnapshot::default()),
+        aggregate_scope,
     }))
 }
 
@@ -1669,6 +1691,11 @@ mod tests {
         let feedback: OpXyFeedbackConfig =
             toml::from_str("enabled = true\nsplit_activity_cc = 22\n").unwrap();
         assert_eq!(feedback.track_activity_cc, 22);
+        assert_eq!(feedback.aggregate_scope, OpXyAggregateScope::All);
+
+        let feedback: OpXyFeedbackConfig =
+            toml::from_str("enabled = true\naggregate_scope = \"all\"\n").unwrap();
+        assert_eq!(feedback.aggregate_scope, OpXyAggregateScope::All);
     }
 
     #[test]
@@ -1748,6 +1775,7 @@ mod tests {
         let feedback = MidiFeedback {
             tx,
             last_snapshot: std::cell::Cell::new(FeedbackSnapshot::default()),
+            aggregate_scope: OpXyAggregateScope::Mapped,
         };
 
         feedback.update(FeedbackSnapshot::default());

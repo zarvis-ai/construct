@@ -47,12 +47,16 @@ session rows or lineage diagram, a focused document or dynamic panel scrolls
 its own content, and a focused session scrolls chat or terminal history. It
 must not route every scroll event to the session pane regardless of focus.
 
-Scene and transport feedback aggregate the eight sessions resolved into
-`[1]`–`[8]` hardware slots independently of TUI focus. Hidden, archived,
-program, and unassigned sessions do not contribute. Scene encodes attention:
-Scene 2 is selected when any assigned session needs attention, otherwise Scene
+Scene and transport feedback default to using the same session eligibility rule
+as Matrix Rain intensity: every non-archived user session. A configurable
+mapped scope instead aggregates only the eight sessions resolved into
+`[1]`–`[8]` hardware slots independently of TUI focus. Subagents and
+orchestrator/system sessions never contribute. Unassigned sessions contribute
+only in the all-session scope. Mixer and synth feedback remain mapped to
+hardware slots regardless of aggregate scope. Scene encodes attention:
+Scene 2 is selected when any included session needs attention, otherwise Scene
 1 is selected. Transport independently encodes activity: it runs when any
-assigned session is pending or running and stops otherwise. The four possible
+included session is pending or running and stops otherwise. The four possible
 combinations are therefore Scene 1 stopped, Scene 1 running, Scene 2 stopped,
 and Scene 2 running.
 Construct supplies MIDI real-time Start/Stop while OP-XY retains its internal

@@ -1993,6 +1993,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     indented,
                     has_children,
                     children_expanded,
+                    attention_rollup,
                 } => {
                     let expand_glyph = if *has_children {
                         Some(if *children_expanded { "▼" } else { "▶" })
@@ -2017,7 +2018,9 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     let harness_w = harness.chars().count();
                     // Reserve room for the trailing unblock marker (" ●") so the
                     // right-aligned harness label doesn't shift when it shows.
-                    let marker_w = if s.needs_attention && !s.archived {
+                    let show_attention =
+                        !s.archived && (s.needs_attention || *attention_rollup);
+                    let marker_w = if show_attention {
                         2
                     } else {
                         0
@@ -2095,11 +2098,16 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                 AppListItem::GroupHeader {
                     group,
                     member_count,
+                    attention_rollup,
                 } => {
                     let glyph = if group.collapsed { "▶" } else { "▼" };
                     ListItem::new(Line::from(vec![
                         Span::styled(format!("{glyph} "), Style::default().fg(app.theme.group)),
                         Span::styled(group.name.clone(), group_name_style(&app.theme)),
+                        Span::styled(
+                            if *attention_rollup { " ●" } else { "" },
+                            Style::default().fg(app.theme.info),
+                        ),
                         Span::raw("  "),
                         Span::styled(
                             format!("({member_count})"),
@@ -3603,7 +3611,7 @@ fn fleet_activity_target(app: &App, now: Instant) -> f32 {
     for s in app
         .sessions
         .iter()
-        .filter(|s| s.kind == construct_protocol::SessionKind::User)
+        .filter(|s| crate::app::is_matrix_rain_activity_session(s))
     {
         let active_agent = app
             .agent_statuses
