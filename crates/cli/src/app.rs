@@ -11079,12 +11079,70 @@ impl App {
             return;
         }
 
+        if self.forward_op_xy_scroll_to_child(down) {
+            return;
+        }
+
         let delta = if down { -1 } else { 1 };
         if self.can_scroll_pty_history() {
             self.adjust_scrollback(delta);
         } else if self.view == ViewMode::Chat {
             self.adjust_chat_scroll(delta);
         }
+    }
+
+    /// Forward an encoder detent into the focused pane's child PTY as a
+    /// mouse-wheel report when that child has grabbed the mouse (e.g. Claude
+    /// Code in fullscreen) — the same routing a physical wheel over the pane
+    /// gets from `forward_mouse_to_child`. An encoder has no cursor position,
+    /// so the report is synthesized at the pane's center. Returns `true` when
+    /// the event was queued for the child; `false` falls back to construct's
+    /// own scrollback.
+    fn forward_op_xy_scroll_to_child(&mut self, down: bool) -> bool {
+        // The orchestrator panel keeps its own scrollback semantics — the
+        // encoder scrolls the panel, mirroring `adjust_scrollback`.
+        if self.is_orchestrator_panel_open() {
+            return false;
+        }
+        if self.view != ViewMode::Terminal || !self.in_pty_session() {
+            return false;
+        }
+        let Some(session_id) = self
+            .selection_for_window(self.active_window_id)
+            .and_then(|sel| sel.session_id().map(str::to_owned))
+        else {
+            return false;
+        };
+        let Some(history) = self.histories.get(&session_id) else {
+            return false;
+        };
+        let mode = history.mouse_protocol_mode();
+        if mode == vt100::MouseProtocolMode::None {
+            return false;
+        }
+        let encoding = history.mouse_protocol_encoding();
+        let (cols, rows) = self.active_pane_size();
+        let ev = crossterm::event::MouseEvent {
+            kind: if down {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            },
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let Some(bytes) = crate::mouse_forward::encode(
+            &ev,
+            (cols / 2).max(1),
+            (rows / 2).max(1),
+            mode,
+            encoding,
+        ) else {
+            return false;
+        };
+        self.queue_pty_input(session_id, bytes, "OP-XY scroll");
+        true
     }
 
     pub(crate) fn op_xy_feedback_snapshot(
@@ -14091,6 +14149,64 @@ mod tests {
         app.handle_op_xy_aux_control(crate::midi::OpXyAuxControl::ScrollUp)
             .await;
         assert_eq!(app.program_popup.as_ref().unwrap().scroll_offset, 0);
+        server.abort();
+    }
+
+    // The encoder must follow the same routing as a physical wheel over the
+    // pane: when the focused session's child has grabbed the mouse (e.g.
+    // Claude Code in fullscreen), a detent becomes a wheel report down the
+    // PTY instead of moving construct's own scrollback.
+    #[tokio::test]
+    async fn op_xy_aux_scroll_forwards_to_a_mouse_grabbing_child() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.view = ViewMode::Terminal;
+        app.focus = PaneFocus::View;
+
+        // Without mouse tracking the encoder scrolls construct's scrollback.
+        let mut history = crate::pty_render::ItemHistory::new();
+        history.feed_pty(b"plain output\r\n");
+        let _ = history.replay(120, 36, 0);
+        app.histories.insert("s1".into(), history);
+        app.handle_op_xy_aux_control(crate::midi::OpXyAuxControl::ScrollUp)
+            .await;
+        assert_eq!(
+            app.scrollback_for_window(Some(app.active_window_id)),
+            1,
+            "encoder scrolls construct scrollback while the child is passive"
+        );
+        app.set_scrollback_for_window(Some(app.active_window_id), 0);
+
+        // s1's child enables SGR mouse tracking (DECSET ?1000h + ?1006h).
+        let mut history = crate::pty_render::ItemHistory::new();
+        history.feed_pty(b"\x1b[?1000h\x1b[?1006h");
+        let _ = history.replay(120, 36, 0);
+        app.histories.insert("s1".into(), history);
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        app.handle_op_xy_aux_control(crate::midi::OpXyAuxControl::ScrollDown)
+            .await;
+        let job = rx.try_recv().expect("detent forwarded to the child PTY");
+        assert_eq!(job.session_id, "s1");
+        assert!(
+            job.bytes.starts_with(b"\x1b[<65;") && job.bytes.ends_with(b"M"),
+            "wheel-down SGR report, got {:?}",
+            String::from_utf8_lossy(&job.bytes)
+        );
+        assert_eq!(
+            app.scrollback_for_window(Some(app.active_window_id)),
+            0,
+            "construct scrollback must not move while the child owns the wheel"
+        );
+
+        app.handle_op_xy_aux_control(crate::midi::OpXyAuxControl::ScrollUp)
+            .await;
+        let job = rx.try_recv().expect("scroll-up detent forwarded too");
+        assert!(
+            job.bytes.starts_with(b"\x1b[<64;"),
+            "wheel-up SGR report, got {:?}",
+            String::from_utf8_lossy(&job.bytes)
+        );
         server.abort();
     }
 
