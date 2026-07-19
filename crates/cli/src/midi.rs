@@ -166,6 +166,13 @@ pub struct OpXyFeedbackConfig {
     /// adds a quarter of the range, saturating at four. Clamped to OP-XY's
     /// 40–220 BPM tempo scale; `[0, 0]` disables tempo control entirely.
     pub tempo_range: [u16; 2],
+    /// Seconds the mixer/synth animation rests between heartbeat cycles
+    /// while activity is unchanged. After each burst the animation holds
+    /// steady for this long, then replays one full cycle. Short rests
+    /// approach continuous streaming, which is what locks the OP-XY's
+    /// Bluetooth receive path — values under ~15 s trade that risk back.
+    /// `0` never rests (continuous animation, the pre-fix behavior).
+    pub animation_rest: u16,
 }
 
 impl Default for OpXyFeedbackConfig {
@@ -179,6 +186,7 @@ impl Default for OpXyFeedbackConfig {
             active_range: [25, 40],
             attention_range: [30, 70],
             tempo_range: [60, 180],
+            animation_rest: 30,
         }
     }
 }
@@ -1050,9 +1058,12 @@ fn next_reassert_period(current: std::time::Duration) -> std::time::Duration {
 /// the output connection. Each probe creates a short-lived CoreMIDI client,
 /// so this stays coarse.
 const FEEDBACK_RECONNECT_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
-/// While holding, the steady values are re-sent at this slow cadence so a
-/// silently dropped packet cannot leave a stale level on the device forever.
-const FEEDBACK_HOLD_REFRESH_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+/// The configured rest between animation heartbeat cycles. `animation_rest
+/// = 0` never reaches a hold frame (the animation never quiesces), so the
+/// one-second floor here only guards against scheduling a zero-length rest.
+fn animation_rest_period(config: &OpXyFeedbackConfig) -> std::time::Duration {
+    std::time::Duration::from_secs(u64::from(config.animation_rest.max(1)))
+}
 
 /// Frames in one synth-parameter active cycle: a short three-level jump
 /// pattern so the OP-XY synth graphics visibly snap between levels instead
@@ -1141,14 +1152,17 @@ fn phase_offset_values(
     values
 }
 
-/// Paces the activity animation so Bluetooth traffic is bursty: a few full
-/// motion cycles after every activity change, then a steady hold refreshed
-/// slowly until the next change.
+/// Paces the activity animation so Bluetooth traffic is bursty: a full
+/// motion cycle after every activity change, then a steady hold until the
+/// configured rest elapses and a heartbeat cycle replays.
 #[derive(Debug)]
 struct ActivityAnimation {
     synth_active: [u8; SYNTH_ACTIVE_FRAME_COUNT],
     synth_attention: [u8; SYNTH_ATTENTION_FRAME_COUNT],
     frame: usize,
+    /// `animation_rest = 0`: never quiesce — continuous animation, the
+    /// explicit opt-in back to pre-burst behavior and its wedge risk.
+    rest_disabled: bool,
 }
 
 impl ActivityAnimation {
@@ -1157,6 +1171,7 @@ impl ActivityAnimation {
             synth_active: synth_active_curve(config.active_range),
             synth_attention: synth_attention_curve(config.attention_range),
             frame: 0,
+            rest_disabled: config.animation_rest == 0,
         }
     }
 
@@ -1165,7 +1180,7 @@ impl ActivityAnimation {
     }
 
     fn quiesced(&self) -> bool {
-        self.frame >= FEEDBACK_ANIMATION_FRAMES_BEFORE_HOLD
+        !self.rest_disabled && self.frame >= FEEDBACK_ANIMATION_FRAMES_BEFORE_HOLD
     }
 
     fn next_frame(&mut self) -> ActivityFrame {
@@ -1226,6 +1241,7 @@ fn feedback_loop(
     let mut reassert_period = FEEDBACK_REASSERT_MIN_PERIOD;
     let mut animation = ActivityAnimation::new(&config);
     let mut next_volume_frame = std::time::Instant::now();
+    let mut held = false;
     let mut next_connect_attempt = std::time::Instant::now() + FEEDBACK_RECONNECT_PERIOD;
     // `false` marks the connection as dead; the sends themselves are lossy
     // (Bluetooth), so only an Err from CoreMIDI — a disposed endpoint after
@@ -1345,7 +1361,15 @@ fn feedback_loop(
             | snapshot.active_tracks
             | snapshot.attention_tracks;
         if any_activity != 0 && now >= next_volume_frame {
+            // A hold frame was sent and the configured rest has now elapsed:
+            // wake a heartbeat cycle so long-unchanged activity still shows
+            // motion. `held` disambiguates "cycle just finished" (emit the
+            // hold frame first) from "rest is over" (replay a cycle).
+            if held && animation.quiesced() {
+                animation.on_change();
+            }
             let frame = animation.next_frame();
+            held = frame.hold;
             connection_ok &= send_activity_frame(
                 active_connection,
                 snapshot.active_slots,
@@ -1360,7 +1384,7 @@ fn feedback_loop(
             );
             next_volume_frame = now
                 + if frame.hold {
-                    FEEDBACK_HOLD_REFRESH_PERIOD
+                    animation_rest_period(&config)
                 } else {
                     feedback_frame_period(snapshot)
                 };
@@ -2096,6 +2120,43 @@ mod tests {
         };
         feedback.update(attention);
         assert_eq!(rx.try_recv().unwrap(), attention);
+    }
+
+    #[test]
+    fn animation_rest_zero_never_quiesces() {
+        let config = OpXyFeedbackConfig {
+            animation_rest: 0,
+            ..Default::default()
+        };
+        let mut animation = ActivityAnimation::new(&config);
+        for frame_index in 0..(FEEDBACK_ANIMATION_FRAMES_BEFORE_HOLD * 3) {
+            assert!(
+                !animation.next_frame().hold,
+                "rest 0 opts back into continuous animation (frame {frame_index})"
+            );
+        }
+    }
+
+    #[test]
+    fn heartbeat_replays_a_full_cycle_after_each_rest() {
+        let config = OpXyFeedbackConfig::default();
+        assert_eq!(config.animation_rest, 30);
+        assert_eq!(animation_rest_period(&config).as_secs(), 30);
+        let mut animation = ActivityAnimation::new(&config);
+        for _ in 0..FEEDBACK_ANIMATION_FRAMES_BEFORE_HOLD {
+            assert!(!animation.next_frame().hold);
+        }
+        assert!(animation.next_frame().hold, "burst ends in a hold frame");
+        // The loop's heartbeat: once the rest elapses it calls `on_change`,
+        // which must buy exactly one more full cycle before the next hold.
+        animation.on_change();
+        for frame_index in 0..FEEDBACK_ANIMATION_FRAMES_BEFORE_HOLD {
+            assert!(
+                !animation.next_frame().hold,
+                "heartbeat frame {frame_index} animates"
+            );
+        }
+        assert!(animation.next_frame().hold, "then rests again");
     }
 
     #[test]

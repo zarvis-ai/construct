@@ -129,13 +129,15 @@ Bluetooth feedback traffic is bounded by decoded CC work, not just packet
 count. Animation dynamically slows as more mixer tracks and synth parameters
 are visible so it emits at most sixteen CC messages per second; all messages
 for a frame remain batched into one packet. Activity animation is a burst,
-not a sustained stream: after an activity change the motion plays a small
-fixed number of full cycles, then freezes at steady held levels — with held
-attention distinguishably louder than held activity — refreshed at a slow
-bounded cadence so a dropped packet cannot leave a stale level behind.
-Sustained continuous streaming is what locks the OP-XY's Bluetooth receive
-path, so long-running unchanged activity must approach zero sustained
-traffic. State updates queued while the
+not a sustained stream: after an activity change the motion plays a full
+cycle, then rests at steady held levels — with held attention
+distinguishably louder than held activity — for a configurable interval
+before replaying one heartbeat cycle, so long-running unchanged activity
+still pulses periodically and held levels cannot go stale. Sustained
+continuous streaming is what locks the OP-XY's Bluetooth receive path, so
+the default rest keeps the duty cycle low; shortening the rest toward zero
+approaches continuous streaming and consciously trades that wedge risk
+back, and a zero rest is the explicit opt-in to continuous animation. State updates queued while the
 transport is busy are coalesced to the newest snapshot so stale scene,
 transport, mixer, and synth states are never replayed after backpressure clears.
 The desired global state is reasserted after reported success because

@@ -200,10 +200,13 @@ OP-XY synth graphic (with the four-frame active cycle, all four levels are
 visible simultaneously).
 
 Mixer and synth animation is a burst, not a continuous stream: after each
-activity change the motion plays a few full cycles, then freezes at steady
-levels (refreshed every 30 seconds) until the next change. Sustained
-streaming is what can lock the OP-XY's Bluetooth receive path, so
-long-unchanged activity intentionally goes quiet.
+activity change the motion plays a full cycle, then rests at steady levels
+for `animation_rest` seconds (default 30) before replaying one heartbeat
+cycle — so long-running activity still pulses periodically instead of
+freezing forever. Sustained streaming is what can lock the OP-XY's Bluetooth
+receive path, which is why the rest exists: values under ~15 seconds
+approach continuous streaming and trade that wedge risk back, and
+`animation_rest = 0` opts all the way back into continuous animation.
 
 Widen both ranges to make the OP-XY synth graphics move more visibly, e.g.
 `active_range = [10, 90]` and `attention_range = [10, 90]`. These keys affect
@@ -252,6 +255,8 @@ active_range = [10, 90]
 attention_range = [10, 90]
 # Sequencer BPM at zero → four-plus live-active sessions ([0, 0] disables):
 tempo_range = [60, 180]
+# Seconds of stillness between animation heartbeat cycles (0 = continuous):
+animation_rest = 30
 ```
 
 `track_activity_cc` is the first of four consecutive parameter CCs. The legacy
