@@ -179,11 +179,23 @@ the aggregate scene. Mixer tracks 1–8 correspond to title slots
 Multiple active and attention slots animate together. Exiting Construct resets
 all eight track volumes to zero.
 
-Synth tracks 1–4 mirror session slots `[1]`–`[4]`, using the same idle, running,
-and attention envelopes independently of split placement or keyboard focus.
-All four primary synth parameters move together. Their default targets are CC
-12–15; choose another starting CC from the OP-XY track-parameter range when the
-template uses a different engine or preferred visual controls.
+Synth tracks 1–4 mirror session slots `[1]`–`[4]`, independently of split
+placement or keyboard focus. All four primary synth parameters move together.
+Their default targets are CC 12–15; choose another starting CC from the OP-XY
+track-parameter range when the template uses a different engine or preferred
+visual controls. Unlike the fixed mixer envelopes, the synth animation ranges
+are configurable in `midi.toml` as percents of the 0–127 CC range:
+
+- Pending or running: a smooth, continuous sweep between `active_range`
+  (default `[25, 40]`).
+- Blue attention dot: a bounce between `attention_range` (default `[30, 70]`)
+  — a quick rise toward the maximum, a fall back to the minimum, then a hold
+  at the minimum for several frames before the next bounce.
+
+Widen both ranges to make the OP-XY synth graphics move more visibly, e.g.
+`active_range = [10, 90]` and `attention_range = [10, 90]`. These keys affect
+only the synth parameter animation; mixer CC 7 volumes always use the fixed
+25–40% and 30–70% envelopes above.
 
 Construct sends MIDI Start/Stop for transport but deliberately leaves timing to
 the OP-XY's internal clock. Animation dynamically slows as more mixer tracks
@@ -206,6 +218,9 @@ aggregate_scope = "all" # or "mapped"
 normal_scene = 1
 attention_scene = 2
 track_activity_cc = 12
+# Synth-track animation ranges, as percents of 0–127:
+active_range = [10, 90]
+attention_range = [10, 90]
 ```
 
 `track_activity_cc` is the first of four consecutive parameter CCs. The legacy

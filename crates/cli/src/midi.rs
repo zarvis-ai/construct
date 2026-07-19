@@ -148,6 +148,14 @@ pub struct OpXyFeedbackConfig {
     /// First of four consecutive OP-XY synth parameters. Defaults to CC 12–15.
     #[serde(alias = "split_activity_cc")]
     pub track_activity_cc: u8,
+    /// Synth-track animation range while a session is pending/running, as
+    /// `[min, max]` percents of the 0–127 CC range. Active sessions sweep
+    /// smoothly between these bounds. Mixer CC 7 volumes are unaffected.
+    pub active_range: [u8; 2],
+    /// Synth-track animation range while a session needs attention, as
+    /// `[min, max]` percents of the 0–127 CC range. Attention bounces between
+    /// these bounds, pausing at the minimum. Mixer CC 7 volumes are unaffected.
+    pub attention_range: [u8; 2],
 }
 
 impl Default for OpXyFeedbackConfig {
@@ -158,6 +166,8 @@ impl Default for OpXyFeedbackConfig {
             normal_scene: 1,
             attention_scene: 2,
             track_activity_cc: 12,
+            active_range: [25, 40],
+            attention_range: [30, 70],
         }
     }
 }
@@ -1003,6 +1013,57 @@ const FEEDBACK_MAX_CC_MESSAGES_PER_SECOND: u32 = 16;
 const FEEDBACK_RETRY_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
 const FEEDBACK_REASSERT_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Frames in one synth-parameter animation cycle. Kept deliberately longer
+/// than the eight-frame mixer curves so the synth graphics sweep smoothly.
+const SYNTH_FRAME_COUNT: usize = 16;
+
+/// Converts a percent of the 0–127 CC range to a CC value, rounding to the
+/// nearest integer and clamping to the valid CC range.
+fn percent_to_cc(percent: u8) -> u8 {
+    ((u16::from(percent.min(100)) * 127 + 50) / 100).min(127) as u8
+}
+
+fn synth_range_bounds(range: [u8; 2]) -> (u8, u8) {
+    let min = percent_to_cc(range[0].min(range[1]));
+    let max = percent_to_cc(range[0].max(range[1]));
+    (min, max)
+}
+
+/// Smooth triangle sweep from min to max and back over one cycle: the first
+/// half of the frames rises monotonically to the maximum, the second half
+/// falls monotonically back toward the minimum.
+fn synth_active_curve(range: [u8; 2]) -> [u8; SYNTH_FRAME_COUNT] {
+    let (min, max) = synth_range_bounds(range);
+    let mut curve = [0u8; SYNTH_FRAME_COUNT];
+    for (frame, value) in curve.iter_mut().enumerate() {
+        let phase = frame as f64 / SYNTH_FRAME_COUNT as f64;
+        let triangle = 1.0 - (2.0 * phase - 1.0).abs();
+        *value = (f64::from(min) + (f64::from(max) - f64::from(min)) * triangle).round() as u8;
+    }
+    curve
+}
+
+/// Bounce with a pause: a quick rise to the maximum, a fall back to the
+/// minimum, then a hold at the minimum for the remaining frames of the cycle.
+fn synth_attention_curve(range: [u8; 2]) -> [u8; SYNTH_FRAME_COUNT] {
+    const RISE_FRAMES: usize = 2;
+    const FALL_FRAMES: usize = 4;
+    let (min, max) = synth_range_bounds(range);
+    let span = f64::from(max) - f64::from(min);
+    let mut curve = [0u8; SYNTH_FRAME_COUNT];
+    for (frame, value) in curve.iter_mut().enumerate() {
+        let position = if frame < RISE_FRAMES {
+            frame as f64 / RISE_FRAMES as f64
+        } else if frame < RISE_FRAMES + FALL_FRAMES {
+            1.0 - (frame - RISE_FRAMES) as f64 / FALL_FRAMES as f64
+        } else {
+            0.0
+        };
+        *value = (f64::from(min) + span * position).round() as u8;
+    }
+    curve
+}
+
 fn feedback_activity_message_count(snapshot: FeedbackSnapshot) -> u32 {
     (snapshot.active_slots | snapshot.attention_slots).count_ones()
         + (snapshot.active_tracks | snapshot.attention_tracks).count_ones()
@@ -1026,15 +1087,20 @@ fn feedback_loop(
     rx: std_mpsc::Receiver<FeedbackSnapshot>,
     config: OpXyFeedbackConfig,
 ) {
-    // CC 7 is 0–127. Active work moves gently through 25–40%; attention
-    // performs a two-stage damped bounce through 30–70%.
+    // CC 7 is 0–127. Mixer volumes keep fixed envelopes: active work moves
+    // gently through 25–40%; attention performs a two-stage damped bounce
+    // through 30–70%. Synth parameters instead follow configurable ranges,
+    // sweeping smoothly while active and bouncing with a pause under attention.
     const ACTIVE_MOTION: [u8; 8] = [32, 38, 45, 51, 45, 38, 34, 32];
     const ATTENTION_BOUNCE: [u8; 8] = [38, 62, 89, 58, 38, 56, 44, 38];
+    let synth_active = synth_active_curve(config.active_range);
+    let synth_attention = synth_attention_curve(config.attention_range);
     let mut snapshot = FeedbackSnapshot::default();
     let mut transport_started = None;
     let mut sent_fleet = None;
     let mut next_fleet_send = std::time::Instant::now();
     let mut volume_frame = 0usize;
+    let mut synth_frame = 0usize;
     let mut next_volume_frame = std::time::Instant::now();
     send_slot_volumes(&mut connection, u8::MAX, 0);
     send_pane_parameters(&mut connection, 0b0000_1111, config.track_activity_cc, 0);
@@ -1058,6 +1124,7 @@ fn feedback_loop(
                     let next_visible = next.active_slots | next.attention_slots;
                     send_slot_volumes(&mut connection, previous_visible & !next_visible, 0);
                     volume_frame = 0;
+                    synth_frame = 0;
                     next_volume_frame = std::time::Instant::now();
                 }
                 if next.active_tracks != snapshot.active_tracks
@@ -1072,6 +1139,7 @@ fn feedback_loop(
                         0,
                     );
                     volume_frame = 0;
+                    synth_frame = 0;
                     next_volume_frame = std::time::Instant::now();
                 }
                 snapshot = next;
@@ -1114,8 +1182,11 @@ fn feedback_loop(
                 config.track_activity_cc,
                 ACTIVE_MOTION[volume_frame],
                 ATTENTION_BOUNCE[volume_frame],
+                synth_active[synth_frame],
+                synth_attention[synth_frame],
             );
             volume_frame = (volume_frame + 1) % ACTIVE_MOTION.len();
+            synth_frame = (synth_frame + 1) % SYNTH_FRAME_COUNT;
             next_volume_frame = now + feedback_frame_period(snapshot);
         }
     }
@@ -1245,6 +1316,8 @@ fn send_activity_frame(
     pane_cc: u8,
     active_value: u8,
     attention_value: u8,
+    synth_active_value: u8,
+    synth_attention_value: u8,
 ) {
     let mut packet =
         activity_volume_packet(active_slots, attention_slots, active_value, attention_value);
@@ -1252,8 +1325,8 @@ fn send_activity_frame(
         active_tracks,
         attention_tracks,
         pane_cc,
-        active_value,
-        attention_value,
+        synth_active_value,
+        synth_attention_value,
     ));
     if !packet.is_empty() {
         let _ = connection.send(&packet);
@@ -1942,6 +2015,93 @@ mod tests {
                 MidiAction::from_str(&action.label(), true).unwrap(),
                 *action
             );
+        }
+    }
+
+    #[test]
+    fn synth_feedback_ranges_default_to_current_envelopes() {
+        let config = OpXyFeedbackConfig::default();
+        assert_eq!(config.active_range, [25, 40]);
+        assert_eq!(config.attention_range, [30, 70]);
+
+        let active = synth_active_curve(config.active_range);
+        assert_eq!(*active.iter().min().unwrap(), 32, "25% of 127 rounds to 32");
+        assert_eq!(*active.iter().max().unwrap(), 51, "40% of 127 rounds to 51");
+        let attention = synth_attention_curve(config.attention_range);
+        assert_eq!(
+            *attention.iter().min().unwrap(),
+            38,
+            "30% of 127 rounds to 38"
+        );
+        assert_eq!(
+            *attention.iter().max().unwrap(),
+            89,
+            "70% of 127 rounds to 89"
+        );
+
+        let parsed: OpXyFeedbackConfig =
+            toml::from_str("active_range = [10, 90]\nattention_range = [5, 95]\n").unwrap();
+        assert_eq!(parsed.active_range, [10, 90]);
+        assert_eq!(parsed.attention_range, [5, 95]);
+    }
+
+    #[test]
+    fn synth_active_curve_sweeps_smoothly_between_configured_bounds() {
+        let curve = synth_active_curve([10, 90]);
+        assert_eq!(*curve.iter().min().unwrap(), 13, "10% of 127 rounds to 13");
+        assert_eq!(
+            *curve.iter().max().unwrap(),
+            114,
+            "90% of 127 rounds to 114"
+        );
+        let (rising, falling) = curve.split_at(SYNTH_FRAME_COUNT / 2);
+        assert!(
+            rising.windows(2).all(|pair| pair[0] <= pair[1]),
+            "first half of the cycle rises monotonically: {curve:?}"
+        );
+        assert!(
+            falling.windows(2).all(|pair| pair[0] >= pair[1]),
+            "second half of the cycle falls monotonically: {curve:?}"
+        );
+    }
+
+    #[test]
+    fn synth_attention_curve_bounces_then_holds_at_minimum() {
+        let curve = synth_attention_curve([10, 90]);
+        assert_eq!(curve[0], 13);
+        assert_eq!(
+            *curve.iter().max().unwrap(),
+            114,
+            "the bounce peaks at the configured maximum"
+        );
+        let peak = curve.iter().position(|value| *value == 114).unwrap();
+        assert!(peak <= 2, "the bounce rises quickly: {curve:?}");
+        let hold = &curve[6..];
+        assert!(
+            hold.iter().all(|value| *value == 13),
+            "the tail holds at the minimum for several frames: {curve:?}"
+        );
+    }
+
+    #[test]
+    fn percent_to_cc_rounds_and_clamps_to_the_cc_range() {
+        assert_eq!(percent_to_cc(0), 0);
+        assert_eq!(percent_to_cc(50), 64);
+        assert_eq!(percent_to_cc(100), 127);
+        assert_eq!(percent_to_cc(200), 127);
+    }
+
+    #[test]
+    fn synth_feedback_ranges_do_not_change_mixer_volume_packets() {
+        // Mixer CC 7 envelopes are fixed constants in the feedback loop; the
+        // configurable synth ranges only feed `activity_pane_packet`.
+        for range in [[25, 40], [10, 90]] {
+            let curve = synth_active_curve(range);
+            let volume = activity_volume_packet(0b0000_0011, 0b0000_0010, 32, 51);
+            let pane = activity_pane_packet(0b0000_0001, 0, 12, curve[0], curve[0]);
+            assert!(volume.chunks(3).all(|m| m[1] == 7));
+            assert!(pane.chunks(3).all(|m| m[1] != 7));
+            assert_eq!(volume, activity_volume_packet(0b0000_0011, 0b0000_0010, 32, 51));
         }
     }
 

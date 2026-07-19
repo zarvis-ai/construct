@@ -74,9 +74,13 @@ between 30% and 70%. Simultaneous active and attention slots animate together.
 Feedback shutdown resets all eight volumes to zero.
 
 Synth tracks 1–4 are a second activity display for session slots `[1]`–`[4]`,
-independent of split placement and focus. They use the same idle, running, and
-attention envelopes. The four primary synth parameters move together. Their
-starting CC is configurable and defaults to parameter 1, producing CC 12–15.
+independent of split placement and focus. The four primary synth parameters
+move together. Their starting CC is configurable and defaults to parameter 1,
+producing CC 12–15. Their animation ranges are configurable as percents of the
+0–127 CC range: active sessions sweep smoothly and continuously between the
+configured bounds (default 25–40%), while attention bounces between them with
+a pause at the minimum (default 30–70%). These ranges apply only to the synth
+parameters; mixer volumes always keep the fixed 25–40% / 30–70% envelopes.
 
 Auxiliary track 3 supplies generic, focus-sensitive navigation on MIDI channel
 10. Absolute CC 2 maps value changes to Up/Down and absolute CC 3 maps changes
