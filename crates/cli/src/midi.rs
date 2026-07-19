@@ -1041,9 +1041,13 @@ const FEEDBACK_RECONNECT_PERIOD: std::time::Duration = std::time::Duration::from
 /// silently dropped packet cannot leave a stale level on the device forever.
 const FEEDBACK_HOLD_REFRESH_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Frames in one synth-parameter animation cycle. Kept deliberately longer
-/// than the eight-frame mixer curves so the synth graphics sweep smoothly.
-const SYNTH_FRAME_COUNT: usize = 16;
+/// Frames in one synth-parameter active cycle: a short three-level jump
+/// pattern so the OP-XY synth graphics visibly snap between levels instead
+/// of slowly sweeping.
+const SYNTH_ACTIVE_FRAME_COUNT: usize = 4;
+/// Frames in one synth-parameter attention cycle: a snap bounce followed by
+/// a hold-at-minimum pause.
+const SYNTH_ATTENTION_FRAME_COUNT: usize = 10;
 
 /// Converts a percent of the 0–127 CC range to a CC value, rounding to the
 /// nearest integer and clamping to the valid CC range.
@@ -1057,38 +1061,22 @@ fn synth_range_bounds(range: [u8; 2]) -> (u8, u8) {
     (min, max)
 }
 
-/// Smooth triangle sweep from min to max and back over one cycle: the first
-/// half of the frames rises monotonically to the maximum, the second half
-/// falls monotonically back toward the minimum.
-fn synth_active_curve(range: [u8; 2]) -> [u8; SYNTH_FRAME_COUNT] {
+/// Three-level jump cycle `[min, mid, max, mid]`: every frame leaps by
+/// roughly half the configured range, so the synth graphic snaps between
+/// levels instead of nudging. `mid` is the rounded midpoint of the range.
+fn synth_active_curve(range: [u8; 2]) -> [u8; SYNTH_ACTIVE_FRAME_COUNT] {
     let (min, max) = synth_range_bounds(range);
-    let mut curve = [0u8; SYNTH_FRAME_COUNT];
-    for (frame, value) in curve.iter_mut().enumerate() {
-        let phase = frame as f64 / SYNTH_FRAME_COUNT as f64;
-        let triangle = 1.0 - (2.0 * phase - 1.0).abs();
-        *value = (f64::from(min) + (f64::from(max) - f64::from(min)) * triangle).round() as u8;
-    }
-    curve
+    let mid = ((u16::from(min) + u16::from(max) + 1) / 2) as u8;
+    [min, mid, max, mid]
 }
 
-/// Bounce with a pause: a quick rise to the maximum, a fall back to the
-/// minimum, then a hold at the minimum for the remaining frames of the cycle.
-fn synth_attention_curve(range: [u8; 2]) -> [u8; SYNTH_FRAME_COUNT] {
-    const RISE_FRAMES: usize = 2;
-    const FALL_FRAMES: usize = 4;
+/// Snap bounce with a pause: jump straight from min to max in one frame,
+/// fall back to min on the next, then hold at min for the remaining frames
+/// of the cycle before bouncing again.
+fn synth_attention_curve(range: [u8; 2]) -> [u8; SYNTH_ATTENTION_FRAME_COUNT] {
     let (min, max) = synth_range_bounds(range);
-    let span = f64::from(max) - f64::from(min);
-    let mut curve = [0u8; SYNTH_FRAME_COUNT];
-    for (frame, value) in curve.iter_mut().enumerate() {
-        let position = if frame < RISE_FRAMES {
-            frame as f64 / RISE_FRAMES as f64
-        } else if frame < RISE_FRAMES + FALL_FRAMES {
-            1.0 - (frame - RISE_FRAMES) as f64 / FALL_FRAMES as f64
-        } else {
-            0.0
-        };
-        *value = (f64::from(min) + span * position).round() as u8;
-    }
+    let mut curve = [min; SYNTH_ATTENTION_FRAME_COUNT];
+    curve[1] = max;
     curve
 }
 
@@ -1105,22 +1093,39 @@ const ATTENTION_BOUNCE: [u8; 8] = [38, 62, 89, 58, 38, 56, 44, 38];
 const ACTIVE_HOLD: u8 = 32;
 const ATTENTION_HOLD: u8 = 62;
 /// Frames played after an activity change before the animation freezes:
-/// three combined cycles, where one combined cycle is the 16-frame synth
-/// sweep (also two full 8-frame mixer cycles), so the freeze always lands
-/// on both curves' starting points. Sustained Bluetooth streaming is what
-/// wedges the OP-XY's BLE receive path, so motion is a burst, not a
-/// constant drip.
-const FEEDBACK_ANIMATION_FRAMES_BEFORE_HOLD: usize = 3 * SYNTH_FRAME_COUNT;
+/// one combined cycle, the least common multiple of the 8-frame mixer
+/// curves, the 4-frame synth jump cycle, and the 10-frame synth bounce, so
+/// the freeze always lands on every curve's starting point. Sustained
+/// Bluetooth streaming is what wedges the OP-XY's BLE receive path, so
+/// motion is a burst, not a constant drip.
+const FEEDBACK_ANIMATION_FRAMES_BEFORE_HOLD: usize = 40;
 
 /// One emitted mixer/synth frame: the levels to send and whether the
-/// animation has settled into its steady hold.
+/// animation has settled into its steady hold. The synth levels carry one
+/// value per parameter — the four parameters of a track play the same curve
+/// phase-offset by one frame, spreading a wave across the synth graphic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ActivityFrame {
     active: u8,
     attention: u8,
-    synth_active: u8,
-    synth_attention: u8,
+    synth_active: [u8; SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
+    synth_attention: [u8; SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
     hold: bool,
+}
+
+/// Values for the four synth parameters of one track at a given frame: the
+/// curve played with each parameter phase-offset by one frame (parameter 1
+/// uses `curve[frame]`, parameter 2 `curve[frame + 1]`, and so on, wrapping
+/// around), so the parameters show distinct levels at any moment.
+fn phase_offset_values(
+    curve: &[u8],
+    frame: usize,
+) -> [u8; SPLIT_ACTIVITY_PARAMETER_COUNT as usize] {
+    let mut values = [0; SPLIT_ACTIVITY_PARAMETER_COUNT as usize];
+    for (offset, value) in values.iter_mut().enumerate() {
+        *value = curve[(frame + offset) % curve.len()];
+    }
+    values
 }
 
 /// Paces the activity animation so Bluetooth traffic is bursty: a few full
@@ -1128,8 +1133,8 @@ struct ActivityFrame {
 /// slowly until the next change.
 #[derive(Debug)]
 struct ActivityAnimation {
-    synth_active: [u8; SYNTH_FRAME_COUNT],
-    synth_attention: [u8; SYNTH_FRAME_COUNT],
+    synth_active: [u8; SYNTH_ACTIVE_FRAME_COUNT],
+    synth_attention: [u8; SYNTH_ATTENTION_FRAME_COUNT],
     frame: usize,
 }
 
@@ -1155,19 +1160,21 @@ impl ActivityAnimation {
             return ActivityFrame {
                 active: ACTIVE_HOLD,
                 attention: ATTENTION_HOLD,
-                // The synth curves' own rest points: the active sweep starts
-                // at its configured minimum, the attention bounce pauses at
-                // its configured minimum.
-                synth_active: self.synth_active[0],
-                synth_attention: self.synth_attention[SYNTH_FRAME_COUNT - 1],
+                // The synth curves' own rest points: the active jump cycle
+                // starts at its configured minimum, the attention bounce
+                // pauses at its configured minimum. Held frames rest flat —
+                // all four parameters at the same level.
+                synth_active: [self.synth_active[0]; SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
+                synth_attention: [self.synth_attention[SYNTH_ATTENTION_FRAME_COUNT - 1];
+                    SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
                 hold: true,
             };
         }
         let frame = ActivityFrame {
             active: ACTIVE_MOTION[self.frame % ACTIVE_MOTION.len()],
             attention: ATTENTION_BOUNCE[self.frame % ATTENTION_BOUNCE.len()],
-            synth_active: self.synth_active[self.frame % SYNTH_FRAME_COUNT],
-            synth_attention: self.synth_attention[self.frame % SYNTH_FRAME_COUNT],
+            synth_active: phase_offset_values(&self.synth_active, self.frame),
+            synth_attention: phase_offset_values(&self.synth_attention, self.frame),
             hold: false,
         };
         self.frame += 1;
@@ -1331,8 +1338,8 @@ fn feedback_loop(
                 config.track_activity_cc,
                 frame.active,
                 frame.attention,
-                frame.synth_active,
-                frame.synth_attention,
+                &frame.synth_active,
+                &frame.synth_attention,
             );
             next_volume_frame = now
                 + if frame.hold {
@@ -1427,8 +1434,8 @@ fn activity_pane_packet(
     active_tracks: u8,
     attention_tracks: u8,
     cc: u8,
-    active_value: u8,
-    attention_value: u8,
+    active_values: &[u8; SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
+    attention_values: &[u8; SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
 ) -> Vec<u8> {
     let visible = (active_tracks | attention_tracks) & 0b0000_1111;
     let mut packet = Vec::with_capacity(
@@ -1436,16 +1443,17 @@ fn activity_pane_packet(
     );
     for pane in 0..4 {
         let bit = 1 << pane;
-        let value = if attention_tracks & bit != 0 {
-            Some(attention_value)
+        let values = if attention_tracks & bit != 0 {
+            Some(attention_values)
         } else if active_tracks & bit != 0 {
-            Some(active_value)
+            Some(active_values)
         } else {
             None
         };
-        if let Some(value) = value {
-            for parameter_cc in split_activity_ccs(cc) {
-                if let Some(message) = pane_parameter_message(pane, parameter_cc, value) {
+        if let Some(values) = values {
+            for (parameter, parameter_cc) in split_activity_ccs(cc).enumerate() {
+                if let Some(message) = pane_parameter_message(pane, parameter_cc, values[parameter])
+                {
                     packet.extend_from_slice(&message);
                 }
             }
@@ -1464,8 +1472,8 @@ fn send_activity_frame(
     pane_cc: u8,
     active_value: u8,
     attention_value: u8,
-    synth_active_value: u8,
-    synth_attention_value: u8,
+    synth_active_values: &[u8; SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
+    synth_attention_values: &[u8; SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
 ) -> bool {
     let mut packet =
         activity_volume_packet(active_slots, attention_slots, active_value, attention_value);
@@ -1473,8 +1481,8 @@ fn send_activity_frame(
         active_tracks,
         attention_tracks,
         pane_cc,
-        synth_active_value,
-        synth_attention_value,
+        synth_active_values,
+        synth_attention_values,
     ));
     packet.is_empty() || connection.send(&packet).is_ok()
 }
@@ -2170,11 +2178,11 @@ mod tests {
             );
             assert_eq!(
                 frame.synth_active,
-                synth_active[frame_index % SYNTH_FRAME_COUNT]
+                phase_offset_values(&synth_active, frame_index)
             );
             assert_eq!(
                 frame.synth_attention,
-                synth_attention[frame_index % SYNTH_FRAME_COUNT]
+                phase_offset_values(&synth_attention, frame_index)
             );
         }
         // …then the animation freezes at steady, distinguishable holds.
@@ -2184,13 +2192,15 @@ mod tests {
             assert_eq!(frame.active, ACTIVE_HOLD);
             assert_eq!(frame.attention, ATTENTION_HOLD);
             assert_eq!(
-                frame.synth_active, synth_active[0],
-                "held synth activity rests at the configured sweep start"
+                frame.synth_active,
+                [synth_active[0]; SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
+                "held synth activity rests flat at the configured jump-cycle start"
             );
             assert_eq!(
                 frame.synth_attention,
-                synth_attention[SYNTH_FRAME_COUNT - 1],
-                "held synth attention rests at the configured pause level"
+                [synth_attention[SYNTH_ATTENTION_FRAME_COUNT - 1];
+                    SPLIT_ACTIVITY_PARAMETER_COUNT as usize],
+                "held synth attention rests flat at the configured pause level"
             );
         }
         assert!(
@@ -2269,10 +2279,48 @@ mod tests {
             ]
         );
         assert_eq!(
-            activity_pane_packet(0b0000_1100, 0b0000_1000, 12, 40, 70),
+            activity_pane_packet(0b0000_1100, 0b0000_1000, 12, &[40; 4], &[70; 4]),
             vec![
                 0xB2, 12, 40, 0xB2, 13, 40, 0xB2, 14, 40, 0xB2, 15, 40, 0xB3, 12, 70,
                 0xB3, 13, 70, 0xB3, 14, 70, 0xB3, 15, 70,
+            ]
+        );
+    }
+
+    #[test]
+    fn activity_pane_packet_phase_offsets_the_four_synth_parameters() {
+        // Each parameter plays the same curve one frame ahead of the previous
+        // one, so the four CCs of a track carry distinct levels.
+        let active = synth_active_curve([10, 90]);
+        let values = phase_offset_values(&active, 0);
+        assert_eq!(values, [13, 64, 114, 64]);
+        assert_eq!(
+            activity_pane_packet(0b0000_0001, 0, 12, &values, &[0; 4]),
+            vec![
+                0xB0, 12, 13, 0xB0, 13, 64, 0xB0, 14, 114, 0xB0, 15, 64,
+            ]
+        );
+
+        // Phase wraps around the cycle end.
+        assert_eq!(phase_offset_values(&active, 3), [64, 13, 64, 114]);
+        // With the four-frame active curve, every frame shows all four levels.
+        for frame in 0..SYNTH_ACTIVE_FRAME_COUNT {
+            let mut levels = phase_offset_values(&active, frame);
+            levels.sort_unstable();
+            assert_eq!(levels, [13, 64, 64, 114], "frame {frame}");
+        }
+
+        // The attention curve offsets the same way; its hold tail can momentarily
+        // coincide at the minimum.
+        let attention = synth_attention_curve([10, 90]);
+        assert_eq!(phase_offset_values(&attention, 0), [13, 114, 13, 13]);
+        assert_eq!(phase_offset_values(&attention, 9), [13, 13, 114, 13]);
+        assert_eq!(phase_offset_values(&attention, 3), [13, 13, 13, 13]);
+        let values = phase_offset_values(&attention, 0);
+        assert_eq!(
+            activity_pane_packet(0, 0b0000_0010, 12, &[0; 4], &values),
+            vec![
+                0xB1, 12, 13, 0xB1, 13, 114, 0xB1, 14, 13, 0xB1, 15, 13,
             ]
         );
     }
@@ -2315,41 +2363,47 @@ mod tests {
     }
 
     #[test]
-    fn synth_active_curve_sweeps_smoothly_between_configured_bounds() {
+    fn synth_active_curve_jumps_between_three_levels() {
         let curve = synth_active_curve([10, 90]);
-        assert_eq!(*curve.iter().min().unwrap(), 13, "10% of 127 rounds to 13");
-        assert_eq!(
-            *curve.iter().max().unwrap(),
-            114,
-            "90% of 127 rounds to 114"
-        );
-        let (rising, falling) = curve.split_at(SYNTH_FRAME_COUNT / 2);
+        assert_eq!(curve.len(), 4);
+        assert_eq!(curve[0], 13, "10% of 127 rounds to 13");
+        assert_eq!(curve[2], 114, "90% of 127 rounds to 114");
+        assert_eq!(curve[1], curve[3], "mid levels match: {curve:?}");
+        assert_eq!(curve[1], (13 + 114 + 1) / 2, "mid is the rounded midpoint");
+        let min_step = curve
+            .windows(2)
+            .map(|pair| pair[0].abs_diff(pair[1]))
+            .min()
+            .unwrap();
         assert!(
-            rising.windows(2).all(|pair| pair[0] <= pair[1]),
-            "first half of the cycle rises monotonically: {curve:?}"
+            min_step >= (114 - 13) / 2,
+            "every frame jumps by at least half the range: {curve:?}"
         );
-        assert!(
-            falling.windows(2).all(|pair| pair[0] >= pair[1]),
-            "second half of the cycle falls monotonically: {curve:?}"
-        );
+
+        let default_curve = synth_active_curve([25, 40]);
+        assert_eq!(default_curve[0], 32);
+        assert_eq!(default_curve[2], 51);
     }
 
     #[test]
-    fn synth_attention_curve_bounces_then_holds_at_minimum() {
+    fn synth_attention_curve_snaps_then_holds_at_minimum() {
         let curve = synth_attention_curve([10, 90]);
         assert_eq!(curve[0], 13);
-        assert_eq!(
-            *curve.iter().max().unwrap(),
-            114,
-            "the bounce peaks at the configured maximum"
-        );
-        let peak = curve.iter().position(|value| *value == 114).unwrap();
-        assert!(peak <= 2, "the bounce rises quickly: {curve:?}");
-        let hold = &curve[6..];
+        assert_eq!(curve[1], 114, "the bounce snaps to max in one frame");
+        assert_eq!(curve[2], 13, "the bounce falls back to min in one frame");
+        let hold = &curve[2..];
         assert!(
             hold.iter().all(|value| *value == 13),
             "the tail holds at the minimum for several frames: {curve:?}"
         );
+        assert!(
+            hold.len() >= 6,
+            "the hold spans at least six frames: {curve:?}"
+        );
+
+        let default_curve = synth_attention_curve([30, 70]);
+        assert_eq!(default_curve[0], 38);
+        assert_eq!(default_curve[1], 89);
     }
 
     #[test]
@@ -2367,7 +2421,7 @@ mod tests {
         for range in [[25, 40], [10, 90]] {
             let curve = synth_active_curve(range);
             let volume = activity_volume_packet(0b0000_0011, 0b0000_0010, 32, 51);
-            let pane = activity_pane_packet(0b0000_0001, 0, 12, curve[0], curve[0]);
+            let pane = activity_pane_packet(0b0000_0001, 0, 12, &curve, &[0; 4]);
             assert!(volume.chunks(3).all(|m| m[1] == 7));
             assert!(pane.chunks(3).all(|m| m[1] != 7));
             assert_eq!(volume, activity_volume_packet(0b0000_0011, 0b0000_0010, 32, 51));

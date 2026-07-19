@@ -96,11 +96,16 @@ Synth tracks 1–4 are a second activity display for session slots `[1]`–`[4]`
 independent of split placement and focus. The four primary synth parameters
 move together. Their starting CC is configurable and defaults to parameter 1,
 producing CC 12–15. Their animation ranges are configurable as percents of the
-0–127 CC range: active sessions sweep smoothly between the
-configured bounds (default 25–40%), while attention bounces between them with
-a pause at the minimum (default 30–70%). These ranges apply only to the synth
+0–127 CC range: active sessions jump between three levels — minimum,
+midpoint, maximum — within the configured bounds (default 25–40%), while
+attention snap-bounces between them, leaping to the maximum in one frame and
+falling back the next, with a pause at the minimum (default 30–70%). These
+ranges apply only to the synth
 parameters; mixer volumes always keep the fixed 25–40% / 30–70% envelopes.
-While streaming, the sweep is continuous; how long streaming lasts is
+The four parameters of each track play the same curve phase-offset by one
+frame, so they show different levels at any moment — a wave across the synth
+graphic.
+While streaming, the jumps repeat continuously; how long streaming lasts is
 governed by the Bluetooth burst rule below, with held synth values resting at
 each curve's own configured minimum.
 

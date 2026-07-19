@@ -186,11 +186,18 @@ track-parameter range when the template uses a different engine or preferred
 visual controls. Unlike the fixed mixer envelopes, the synth animation ranges
 are configurable in `midi.toml` as percents of the 0–127 CC range:
 
-- Pending or running: a smooth sweep between `active_range`
-  (default `[25, 40]`).
-- Blue attention dot: a bounce between `attention_range` (default `[30, 70]`)
-  — a quick rise toward the maximum, a fall back to the minimum, then a hold
-  at the minimum for several frames before the next bounce.
+- Pending or running: a three-level jump cycle between `active_range`
+  (default `[25, 40]`) — each frame snaps between the minimum, the midpoint,
+  and the maximum so the synth graphics visibly jump rather than drift.
+- Blue attention dot: a snap bounce between `attention_range` (default
+  `[30, 70]`) — jumping straight from the minimum to the maximum in one
+  frame, falling back on the next, then holding at the minimum for several
+  frames before the next bounce.
+
+The four parameters of each synth track play the same curve phase-offset by
+one frame, so at any moment they show different levels — a wave across the
+OP-XY synth graphic (with the four-frame active cycle, all four levels are
+visible simultaneously).
 
 Mixer and synth animation is a burst, not a continuous stream: after each
 activity change the motion plays a few full cycles, then freezes at steady
