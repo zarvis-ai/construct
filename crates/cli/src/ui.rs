@@ -3623,7 +3623,10 @@ fn fleet_activity_target(app: &App, now: Instant) -> f32 {
     rain_activity_for_active_sessions(active_count)
 }
 
-fn rain_activity_for_active_sessions(active_count: u16) -> f32 {
+/// The Matrix Rain intensity curve: each live-active session adds a quarter
+/// of full intensity, saturating at four. Shared with OP-XY tempo feedback so
+/// both surfaces breathe to the same fleet signal.
+pub(crate) fn rain_activity_for_active_sessions(active_count: u16) -> f32 {
     (active_count as f32 * 0.25).clamp(0.0, 1.0)
 }
 

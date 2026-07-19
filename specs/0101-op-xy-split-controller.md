@@ -72,6 +72,19 @@ clock. Session-state and attention-marker changes update feedback as part of
 handling the event that changed them; feedback must not depend on an animation
 timer.
 
+Sequencer tempo encodes fleet activity volume. The count of live-active
+sessions — the same fleet-wide Matrix Rain signal, in every aggregate scope —
+runs through the rain intensity curve (each session a quarter step,
+saturating at four) onto a configurable BPM range, so the sequencer's LED
+chase speeds up as more sessions work and slows as the fleet quiets. Tempo is
+set through the device's dedicated tempo controller message, never by
+streaming MIDI clock, and it travels in the same packet as the scene
+reasserts so activity-driven tempo adds no sustained Bluetooth traffic. The
+range is clamped to the tempo values the device can express; a zeroed range
+disables tempo control and equal bounds pin a fixed tempo. A tempo-tier
+change refreshes the global state immediately, and reasserting tempo must
+never restart or reposition the sequencer.
+
 Mixer tracks 1–8 are a global activity overview for assigned session slots
 `[1]`–`[8]`, independent of pane focus. Idle and terminal slots have track
 volume zero. Pending and running slots move gently between 25% and 40%. A blue

@@ -122,6 +122,10 @@ pub(crate) struct FeedbackSnapshot {
     /// Low four bits correspond to session slots `[1]`–`[4]` and their synth tracks.
     pub active_tracks: u8,
     pub attention_tracks: u8,
+    /// Live-active sessions by the Matrix Rain predicate, regardless of
+    /// aggregate scope — the fleet-wide signal behind the rain intensity and
+    /// the OP-XY tempo.
+    pub active_sessions: u16,
 }
 
 impl Default for FeedbackSnapshot {
@@ -132,6 +136,7 @@ impl Default for FeedbackSnapshot {
             attention_slots: 0,
             active_tracks: 0,
             attention_tracks: 0,
+            active_sessions: 0,
         }
     }
 }
@@ -156,6 +161,11 @@ pub struct OpXyFeedbackConfig {
     /// `[min, max]` percents of the 0–127 CC range. Attention bounces between
     /// these bounds, pausing at the minimum. Mixer CC 7 volumes are unaffected.
     pub attention_range: [u8; 2],
+    /// `[min, max]` BPM the sequencer tempo moves through as fleet activity
+    /// rises, on the Matrix Rain intensity curve: each live-active session
+    /// adds a quarter of the range, saturating at four. Clamped to OP-XY's
+    /// 40–220 BPM tempo scale; `[0, 0]` disables tempo control entirely.
+    pub tempo_range: [u16; 2],
 }
 
 impl Default for OpXyFeedbackConfig {
@@ -168,6 +178,7 @@ impl Default for OpXyFeedbackConfig {
             track_activity_cc: 12,
             active_range: [25, 40],
             attention_range: [30, 70],
+            tempo_range: [60, 180],
         }
     }
 }
@@ -1216,7 +1227,13 @@ fn feedback_loop(
                 while let Ok(newer) = rx.try_recv() {
                     next = newer;
                 }
-                if next.fleet != snapshot.fleet {
+                // A tempo-tier change re-sends the global state immediately,
+                // same as a scene change — both ride the same packet, so this
+                // costs nothing extra when they change together.
+                if next.fleet != snapshot.fleet
+                    || op_xy_tempo_cc(next.active_sessions, config.tempo_range)
+                        != op_xy_tempo_cc(snapshot.active_sessions, config.tempo_range)
+                {
                     sent_fleet = None;
                     next_fleet_send = std::time::Instant::now();
                 }
@@ -1287,6 +1304,7 @@ fn feedback_loop(
             if send_fleet_state(
                 active_connection,
                 snapshot.fleet,
+                snapshot.active_sessions,
                 &mut transport_started,
                 &config,
                 reassert,
@@ -1465,6 +1483,7 @@ fn send_activity_frame(
 fn send_fleet_state(
     connection: &mut MidiOutputConnection,
     fleet: FeedbackState,
+    active_sessions: u16,
     transport_started: &mut Option<bool>,
     config: &OpXyFeedbackConfig,
     reassert: bool,
@@ -1474,7 +1493,13 @@ fn send_fleet_state(
     } else {
         config.normal_scene
     };
-    let scene_sent = send_scene(connection, scene);
+    // Scene and tempo ride one packet, so tempo-follows-activity adds no
+    // sustained traffic on top of the existing global-state reasserts.
+    let mut packet = vec![0xB0, 85, scene.clamp(1, 99) - 1];
+    if let Some(tempo) = op_xy_tempo_cc(active_sessions, config.tempo_range) {
+        packet.extend([0xB0, 80, tempo]);
+    }
+    let scene_sent = connection.send(&packet).is_ok();
     let should_start = fleet.is_active();
     let transport_status = fleet_transport_status(fleet, *transport_started, reassert);
     let transport_sent = if let Some(status) = transport_status {
@@ -1489,6 +1514,22 @@ fn send_fleet_state(
         true
     };
     scene_sent && transport_sent
+}
+
+/// CC 80 value encoding the fleet's activity as sequencer tempo. The
+/// active-session count runs through the Matrix Rain intensity curve, lands
+/// in the configured `[min, max]` BPM range, and maps onto OP-XY's CC 80
+/// scale (0–127 spans 40–220 BPM), so the sequencer LEDs chase faster as
+/// more sessions work. `None` when tempo control is disabled (`[0, 0]`).
+fn op_xy_tempo_cc(active_sessions: u16, tempo_range: [u16; 2]) -> Option<u8> {
+    if tempo_range == [0, 0] {
+        return None;
+    }
+    let min = f64::from(tempo_range[0].min(tempo_range[1]).clamp(40, 220));
+    let max = f64::from(tempo_range[0].max(tempo_range[1]).clamp(40, 220));
+    let intensity = f64::from(crate::ui::rain_activity_for_active_sessions(active_sessions));
+    let bpm = min + (max - min) * intensity;
+    Some(((bpm - 40.0) * 127.0 / 180.0).round().clamp(0.0, 127.0) as u8)
 }
 
 fn fleet_transport_status(
@@ -1508,7 +1549,10 @@ fn fleet_transport_status(
     }
 }
 
+/// Immediate scene select via CC 85. The reassert path batches this into the
+/// combined global-state packet; kept standalone for one-shot senders.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn send_scene(connection: &mut MidiOutputConnection, one_based_scene: u8) -> bool {
     let value = one_based_scene.clamp(1, 99) - 1;
     connection.send(&[0xB0, 85, value]).is_ok()
@@ -2010,6 +2054,7 @@ mod tests {
             attention_slots: 0,
             active_tracks: 0b0000_0001,
             attention_tracks: 0,
+            active_sessions: 1,
         };
         feedback.update(working);
         assert_eq!(rx.try_recv().unwrap(), working);
@@ -2022,9 +2067,53 @@ mod tests {
             attention_slots: 0b1000_0001,
             active_tracks: 0b0000_0011,
             attention_tracks: 0b0000_0010,
+            active_sessions: 2,
         };
         feedback.update(attention);
         assert_eq!(rx.try_recv().unwrap(), attention);
+    }
+
+    #[test]
+    fn tempo_cc_follows_matrix_rain_activity_tiers() {
+        let range = OpXyFeedbackConfig::default().tempo_range;
+        assert_eq!(range, [60, 180]);
+        // Each live-active session climbs one quarter of the rain intensity
+        // curve: 60/90/120/150/180 BPM on OP-XY's 40–220 CC 80 scale.
+        assert_eq!(op_xy_tempo_cc(0, range), Some(14)); // 60 BPM
+        assert_eq!(op_xy_tempo_cc(1, range), Some(35)); // 90 BPM
+        assert_eq!(op_xy_tempo_cc(2, range), Some(56)); // 120 BPM
+        assert_eq!(op_xy_tempo_cc(3, range), Some(78)); // 150 BPM
+        assert_eq!(op_xy_tempo_cc(4, range), Some(99)); // 180 BPM
+        assert_eq!(
+            op_xy_tempo_cc(9, range),
+            Some(99),
+            "the curve saturates at four active sessions, like the rain"
+        );
+    }
+
+    #[test]
+    fn tempo_cc_clamps_to_op_xy_scale_and_supports_disable() {
+        assert_eq!(op_xy_tempo_cc(4, [0, 0]), None, "[0,0] disables tempo control");
+        assert_eq!(
+            op_xy_tempo_cc(0, [10, 500]),
+            Some(0),
+            "below 40 BPM clamps to the bottom of the CC scale"
+        );
+        assert_eq!(
+            op_xy_tempo_cc(4, [10, 500]),
+            Some(127),
+            "above 220 BPM clamps to the top of the CC scale"
+        );
+        assert_eq!(
+            op_xy_tempo_cc(2, [120, 120]),
+            Some(56),
+            "equal bounds pin the tempo regardless of activity"
+        );
+        assert_eq!(
+            op_xy_tempo_cc(0, [180, 60]),
+            Some(14),
+            "reversed bounds normalize to min..max"
+        );
     }
 
     #[test]

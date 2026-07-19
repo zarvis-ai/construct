@@ -203,6 +203,16 @@ Widen both ranges to make the OP-XY synth graphics move more visibly, e.g.
 only the synth parameter animation; mixer CC 7 volumes always use the fixed
 25–40% and 30–70% envelopes above.
 
+The sequencer tempo follows fleet activity on the same curve as the TUI's
+Matrix Rain intensity: each live-active session adds a quarter of the
+configured `tempo_range` (default `[60, 180]` BPM), saturating at four — so
+with the defaults the sequencer LEDs chase at 60 BPM when everything is idle,
+120 BPM with two sessions working, and 180 BPM with four or more. Tempo is
+set with OP-XY's CC 80 (no MIDI clock is streamed), rides inside the existing
+global-state packet so it adds no extra Bluetooth traffic, and is clamped to
+the device's 40–220 BPM scale. Set `tempo_range = [0, 0]` to leave the
+device's tempo alone entirely, or two equal values to pin it.
+
 Construct sends MIDI Start/Stop for transport but deliberately leaves timing to
 the OP-XY's internal clock. Animation dynamically slows as more mixer tracks
 and synth parameters are active, with a ceiling of sixteen decoded CC messages
@@ -229,6 +239,8 @@ track_activity_cc = 12
 # Synth-track animation ranges, as percents of 0–127:
 active_range = [10, 90]
 attention_range = [10, 90]
+# Sequencer BPM at zero → four-plus live-active sessions ([0, 0] disables):
+tempo_range = [60, 180]
 ```
 
 `track_activity_cc` is the first of four consecutive parameter CCs. The legacy

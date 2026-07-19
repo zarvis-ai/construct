@@ -11091,6 +11091,7 @@ impl App {
         &self,
         aggregate_scope: crate::midi::OpXyAggregateScope,
     ) -> crate::midi::FeedbackSnapshot {
+        let now = Instant::now();
         let slots = self.resolved_op_xy_session_slots();
         let (active_slots, attention_slots) = op_xy_slot_state_masks(&self.sessions, &slots);
         let fleet = match aggregate_scope {
@@ -11101,15 +11102,27 @@ impl App {
                 &self.sessions,
                 &self.agent_statuses,
                 &self.pty_activity,
-                Instant::now(),
+                now,
             ),
         };
+        // Tempo tracks the fleet-wide Matrix Rain signal in both aggregate
+        // scopes: it encodes how busy the whole construct is, not which
+        // hardware slots are mapped.
+        let active_sessions = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                is_matrix_rain_session_active(session, &self.agent_statuses, &self.pty_activity, now)
+            })
+            .count()
+            .min(u16::MAX as usize) as u16;
         crate::midi::FeedbackSnapshot {
             fleet,
             active_slots,
             attention_slots,
             active_tracks: active_slots & 0b0000_1111,
             attention_tracks: attention_slots & 0b0000_1111,
+            active_sessions,
         }
     }
 
@@ -14223,6 +14236,47 @@ mod tests {
         assert!(
             app.lineage_focused,
             "the section's dormant memory survives the jump"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn op_xy_snapshot_counts_live_active_sessions_for_tempo() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut first = summary_with_kind(construct_protocol::SessionKind::User);
+        first.id = "first".into();
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
+        second.id = "second".into();
+        second.state = construct_protocol::SessionState::Running;
+        let mut subagent = summary_with_kind(construct_protocol::SessionKind::Subagent);
+        subagent.id = "sub".into();
+        subagent.parent_session_id = Some(first.id.clone());
+        app.sessions = vec![first, second, subagent];
+
+        let snapshot = app.op_xy_feedback_snapshot(crate::midi::OpXyAggregateScope::All);
+        assert_eq!(
+            snapshot.active_sessions, 0,
+            "a stale persisted Running state is not live activity"
+        );
+
+        let status = construct_protocol::AgentStatus {
+            active: true,
+            started_at_ms: 1,
+            status: "working".into(),
+        };
+        app.agent_statuses.insert("first".into(), status.clone());
+        app.agent_statuses.insert("sub".into(), status);
+        let snapshot = app.op_xy_feedback_snapshot(crate::midi::OpXyAggregateScope::All);
+        assert_eq!(
+            snapshot.active_sessions, 1,
+            "subagents never count toward the fleet tempo signal"
+        );
+
+        let mapped = app.op_xy_feedback_snapshot(crate::midi::OpXyAggregateScope::Mapped);
+        assert_eq!(
+            mapped.active_sessions, 1,
+            "tempo follows the fleet-wide signal in every aggregate scope"
         );
 
         server.abort();
