@@ -18,8 +18,8 @@ More screenshots and demos: [gallery](gallery.md).
   Grok, and smith sessions from your terminal — or let an agent coordinate them.
   CLI-only; no desktop app to install.
 - **Lineage** — sessions branch like ideas do: fork one when you want a
-  parallel attempt (new idea, side quest, or a long shot) — even into a
-  different harness — and merge the results back.
+  parallel attempt (new idea, side quest, or a long shot) — even a
+  cross-harness fork — and merge the results back.
 
   <img src="https://raw.githubusercontent.com/construct-worlds/construct/9de1982e7ec4ae9ad71c32f3f3e3f2f58fbe93ca/demos/fork-merge.gif" alt="construct fork and merge demo" width="70%">
 - **Program** — collaborative, executable Markdown
