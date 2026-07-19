@@ -15,7 +15,13 @@ corresponding visible split pane in reading order. Black key 5 cycles focus
 among that session's split, list row, and lineage section. Black keys 6–8 are
 Escape, the sequencer-display no-op, and Backspace respectively. Learned arrow
 and Enter notes dispatch native TUI input to the selected session's visible
-split.
+split. When the lineage section holds keyboard focus, those notes instead act
+on the section exactly as the equivalent keyboard keys: arrows move its
+highlight, and Enter switches the previously focused split to the highlighted
+lineage node and moves focus into it — the same behavior as clicking that node
+with the mouse. They must not silently pull focus back to the split while the
+section owns the keyboard. Prompt-slot notes keep targeting the session's
+composer regardless of section focus.
 
 Session titles beginning with `[1]` through `[8]` assign those sessions to the
 corresponding hardware slots. The marker may be followed immediately by title

@@ -10921,6 +10921,31 @@ impl App {
             }
             OpXyControl::NoOp => unreachable!(),
             control => {
+                // While the lineage section owns keyboard focus (black key 5
+                // cycles into it), key-like controls act on the section
+                // exactly as the keyboard would: Enter switches the
+                // previously focused split to the highlighted lineage node
+                // and jumps into it — the same path a mouse click on a
+                // lineage box takes — instead of yanking focus back to the
+                // split and typing into its PTY. Prompt slots keep the
+                // focus-and-insert path below: their target is the session's
+                // composer, not the section.
+                if self.focus == PaneFocus::List && self.lineage_focused {
+                    let code = match &control {
+                        OpXyControl::Enter => Some(KeyCode::Enter),
+                        OpXyControl::Left => Some(KeyCode::Left),
+                        OpXyControl::Down => Some(KeyCode::Down),
+                        OpXyControl::Right => Some(KeyCode::Right),
+                        OpXyControl::Up => Some(KeyCode::Up),
+                        OpXyControl::Escape => Some(KeyCode::Esc),
+                        OpXyControl::Backspace => Some(KeyCode::Backspace),
+                        _ => None,
+                    };
+                    if let Some(code) = code {
+                        self.on_key(KeyEvent::new(code, KeyModifiers::NONE)).await;
+                        return;
+                    }
+                }
                 let Some(window_id) = self.op_xy_window_for_session(&session_id) else {
                     self.set_status(format!(
                         "OP-XY session {} is not displayed in a split",
@@ -14129,6 +14154,75 @@ mod tests {
             app.focus,
             PaneFocus::List,
             "display no-op does not require an assigned session or change focus"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn op_xy_enter_on_a_focused_lineage_section_jumps_like_a_click() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut root = summary_with_kind(construct_protocol::SessionKind::User);
+        root.id = "root".into();
+        root.title = Some("[1] root".into());
+        let mut fork = summary_with_kind(construct_protocol::SessionKind::User);
+        fork.id = "fork".into();
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
+            session_id: "root".into(),
+            transcript_seq: 0,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+            is_reset_snapshot: false,
+        });
+        app.sessions = vec![root, fork];
+
+        // Put session [1] in the first split, then black key 5 twice:
+        // split → list → lineage section.
+        let first_window = app.op_xy_pane_window_id(0).expect("first split");
+        app.handle_op_xy_event(crate::midi::OpXyEvent {
+            session: 0,
+            control: crate::midi::OpXyControl::Split(0),
+        })
+        .await;
+        for _ in 0..2 {
+            app.handle_op_xy_event(crate::midi::OpXyEvent {
+                session: 0,
+                control: crate::midi::OpXyControl::CycleFocus,
+            })
+            .await;
+        }
+        assert!(app.lineage_focused);
+
+        // The learned arrow note moves the section's highlight instead of
+        // scrolling the split.
+        app.handle_op_xy_event(crate::midi::OpXyEvent {
+            session: 0,
+            control: crate::midi::OpXyControl::Down,
+        })
+        .await;
+        assert_eq!(app.focus, PaneFocus::List, "arrow keys stay in the section");
+        assert_eq!(app.lineage_selected, 1);
+
+        // The learned Enter note jumps like a mouse click on the lineage
+        // box: the previously focused split switches to the highlighted
+        // session and takes focus.
+        app.handle_op_xy_event(crate::midi::OpXyEvent {
+            session: 0,
+            control: crate::midi::OpXyControl::Enter,
+        })
+        .await;
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(app.active_window_id, first_window);
+        assert_eq!(
+            app.selection_for_window(first_window)
+                .and_then(|selection| selection.session_id().map(str::to_owned))
+                .as_deref(),
+            Some("fork")
+        );
+        assert!(
+            app.lineage_focused,
+            "the section's dormant memory survives the jump"
         );
 
         server.abort();
