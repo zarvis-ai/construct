@@ -156,6 +156,9 @@ async fn tui_remote_status_click_opens_popup_and_remains_at_zero_clients() {
         .await
         .expect("clicking remote status did not open dialog");
     tui.send(b"\x1b").expect("dismiss remote dialog");
+    tui.wait_for_absence("/remote-connect", Duration::from_secs(5))
+        .await
+        .expect("remote dialog did not close");
     tui.wait_for("● remote:0", Duration::from_secs(5))
         .await
         .expect("active zero-client remote status never rendered");

@@ -858,6 +858,7 @@ async fn run_program_command(client: &Client, command: ProgramCommand) -> Result
                     comment: None,
                     shimmer: None,
                     selection_block_ids: None,
+                    fork: false,
                 })
                 .await?;
             println!(

@@ -58,6 +58,7 @@ pub(crate) const PROGRAM_AGENT_REVEAL_MS: i64 = 800;
 pub(crate) const PROGRAM_AGENT_RECENT_ACTIVITY_MS: i64 = 3000;
 pub(crate) const PROGRAM_SELECTION_RUN_MENU_W: u16 = 46;
 const PROGRAM_SELECTION_RUN_BUTTON: &str = "▸ Run";
+const PROGRAM_SELECTION_RUN_MAIN_BUTTON: &str = "▸ Run on main";
 const PROGRAM_SELECTION_RUN_MENU_PAD_X: u16 = 1;
 
 /// Row-fraction range `[start, end)` of a preview image to paint this
@@ -13535,7 +13536,13 @@ fn render_program_selection_context_menu(
         .width
         .saturating_sub(2 + PROGRAM_SELECTION_RUN_MENU_PAD_X.saturating_mul(2))
         as usize;
-    let run_button_width = UnicodeWidthStr::width(PROGRAM_SELECTION_RUN_BUTTON);
+    let run_button = if app.program_selection_run_on_main {
+        PROGRAM_SELECTION_RUN_MAIN_BUTTON
+    } else {
+        PROGRAM_SELECTION_RUN_BUTTON
+    };
+    let run_button_width = UnicodeWidthStr::width(PROGRAM_SELECTION_RUN_MAIN_BUTTON);
+    let rendered_run_button_width = UnicodeWidthStr::width(run_button);
     let button_x = inner_x.saturating_add(inner_width.saturating_sub(run_button_width) as u16);
     let hit = (
         button_x,
@@ -13625,13 +13632,17 @@ fn render_program_selection_context_menu(
             let text_width = UnicodeWidthStr::width(truncated.as_str());
             let pad = comment_width
                 .saturating_sub(text_width)
-                .saturating_add(comment_gap);
+                .saturating_add(comment_gap)
+                // Reserve the longer Shift-preview label when sizing the
+                // comment, but keep the shorter default label pinned to the
+                // same right edge instead of leaving unused space after it.
+                .saturating_add(run_button_width.saturating_sub(rendered_run_button_width));
             let mut spans = vec![
                 Span::styled(truncated, comment_style),
                 Span::raw(" ".repeat(pad)),
             ];
             if idx == 0 {
-                spans.push(Span::styled(PROGRAM_SELECTION_RUN_BUTTON, run_style));
+                spans.push(Span::styled(run_button, run_style));
             }
             f.render_widget(
                 Paragraph::new(Line::from(spans)),
@@ -13666,7 +13677,11 @@ fn render_program_selection_context_menu(
                 });
             let verb_key_selected = menu.focused
                 && menu.selected_action == crate::app::ProgramSelectionAction::Verb(idx);
-            let label = format!("▸ {}", verb.label);
+            let label = if app.program_selection_run_on_main {
+                format!("▸ {} (main)", verb.label)
+            } else {
+                format!("▸ {}", verb.label)
+            };
             let truncated = truncate_to_width(&label, inner_width);
             let text_width = UnicodeWidthStr::width(truncated.as_str());
             let pad = inner_width.saturating_sub(text_width);
@@ -13699,7 +13714,11 @@ fn render_program_selection_context_menu(
         // which row Up/Down lands on.
         if description_rows > 0 {
             let description =
-                program_selection_action_description(menu.selected_action, &verbs)
+                program_selection_action_description(
+                    menu.selected_action,
+                    &verbs,
+                    app.program_selection_run_on_main,
+                )
                     .unwrap_or_default();
             let mut desc_lines = wrap_to_width(&description, inner_width);
             desc_lines.truncate(description_rows);
@@ -13736,7 +13755,7 @@ fn program_selection_inner_width(menu_width: u16) -> usize {
 
 pub(crate) fn program_selection_comment_width(menu_width: u16) -> usize {
     let inner_width = program_selection_inner_width(menu_width);
-    let run_button_width = UnicodeWidthStr::width(PROGRAM_SELECTION_RUN_BUTTON);
+    let run_button_width = UnicodeWidthStr::width(PROGRAM_SELECTION_RUN_MAIN_BUTTON);
     let comment_gap = usize::from(inner_width > run_button_width);
     inner_width
         .saturating_sub(run_button_width)
@@ -13760,7 +13779,8 @@ fn program_selection_description_line_count(
         return 0;
     }
     let width = program_selection_inner_width(menu_width).max(1);
-    let text = program_selection_action_description(menu.selected_action, verbs).unwrap_or_default();
+    let text = program_selection_action_description(menu.selected_action, verbs, false)
+        .unwrap_or_default();
     wrap_to_width(&text, width).len().max(1).min(max_rows.max(1))
 }
 
@@ -13794,13 +13814,19 @@ fn program_selection_comment_line_count(
 fn program_selection_action_description(
     action: crate::app::ProgramSelectionAction,
     verbs: &[construct_protocol::ProgramVerb],
+    run_on_main: bool,
 ) -> Option<String> {
+    let destination = if run_on_main {
+        " Runs on the main session."
+    } else {
+        " Runs in an interactive fork."
+    };
     match action {
         crate::app::ProgramSelectionAction::Comment => {
             Some("Free-text guidance appended to Run or the selected verb.".to_string())
         }
         crate::app::ProgramSelectionAction::Run => {
-            Some("Execute the selection now, as orchestration.".to_string())
+            Some(format!("Execute the selection now, as orchestration.{destination}"))
         }
         crate::app::ProgramSelectionAction::Verb(idx) => {
             let verb = verbs.get(idx)?;
@@ -13808,10 +13834,11 @@ fn program_selection_action_description(
                 construct_protocol::ProgramVerbEffect::Annotate => "Annotate",
                 construct_protocol::ProgramVerbEffect::Rewrite => "Rewrite",
             };
-            Some(match verb.description.as_deref() {
+            let description = match verb.description.as_deref() {
                 Some(desc) if !desc.is_empty() => format!("{effect_label}: {desc}"),
                 _ => effect_label.to_string(),
-            })
+            };
+            Some(format!("{description}{destination}"))
         }
     }
 }

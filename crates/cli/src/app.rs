@@ -1329,6 +1329,10 @@ pub struct App {
     /// selection context menu. Fetched and refreshed the same way as
     /// `program_templates`.
     pub program_verbs: Vec<construct_protocol::ProgramVerb>,
+    /// True while Shift is held under enhanced keyboard reporting, or while
+    /// the latest mouse event carries Shift. The Program selection menu uses
+    /// this to preview its owner-session execution override.
+    pub program_selection_run_on_main: bool,
     /// Background channel for live-reloaded program verbs, the `program_verbs`
     /// counterpart to `program_templates_tx`.
     pub program_verbs_tx: mpsc::UnboundedSender<Vec<construct_protocol::ProgramVerb>>,
@@ -3796,6 +3800,7 @@ async fn run_with_socket_initial_selection(
         program_templates,
         program_templates_tx,
         program_verbs,
+        program_selection_run_on_main: false,
         program_verbs_tx,
         program_markdown_cache: HashMap::new(),
         program_projection_pending: HashSet::new(),
@@ -4040,6 +4045,8 @@ async fn run_with_socket_initial_selection(
             std::io::stdout(),
             crossterm::event::PushKeyboardEnhancementFlags(
                 crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
             )
         );
     }
@@ -8494,7 +8501,19 @@ impl App {
 
     async fn on_term_event(&mut self, ev: CtEvent) {
         match ev {
-            CtEvent::Key(k) => self.on_key(k).await,
+            CtEvent::Key(k) => {
+                use crossterm::event::{KeyEventKind, ModifierKeyCode};
+                if matches!(
+                    k.code,
+                    KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift)
+                ) {
+                    self.program_selection_run_on_main =
+                        !matches!(k.kind, KeyEventKind::Release);
+                }
+                if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    self.on_key(k).await;
+                }
+            }
             CtEvent::Mouse(m) => self.on_mouse(m).await,
             CtEvent::Paste(text) => self.on_paste(text).await,
             CtEvent::Resize(_, _) => {
@@ -8509,6 +8528,7 @@ impl App {
         if !self.mouse_capture_enabled {
             return;
         }
+        self.program_selection_run_on_main = ev.modifiers.contains(KeyModifiers::SHIFT);
         use crossterm::event::MouseButton;
         const LIST_STEP: i32 = 3;
         let scrollback_step = self.mouse_scrollback_step();
@@ -13646,6 +13666,7 @@ mod tests {
             program_templates: Vec::new(),
             program_templates_tx: mpsc::unbounded_channel().0,
             program_verbs: Vec::new(),
+            program_selection_run_on_main: false,
             program_verbs_tx: mpsc::unbounded_channel().0,
             program_markdown_cache: HashMap::new(),
             program_projection_pending: HashSet::new(),
@@ -18556,6 +18577,22 @@ mod tests {
             text.contains("Execute the selection now"),
             "Run's description shows while Run is highlighted: {text:?}"
         );
+        assert!(
+            text.contains("interactive") && text.contains("fork."),
+            "the default destination is explicit: {text:?}"
+        );
+
+        app.program_selection_run_on_main = true;
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render with Shift held");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("Run on main")
+                && text.contains("Runs on the main")
+                && text.contains("session."),
+            "holding Shift previews the owner-session override: {text:?}"
+        );
+        app.program_selection_run_on_main = false;
 
         app.program_popup.as_mut().unwrap().selection_menu.as_mut().unwrap().selected_action =
             ProgramSelectionAction::Verb(0);
@@ -21719,6 +21756,11 @@ mod tests {
             Some("focus tests"),
             "clicking the unified Run button should include any typed instruction"
         );
+        assert_eq!(
+            params.get("fork").and_then(Value::as_bool),
+            Some(true),
+            "plain selection Run click should use an interactive fork"
+        );
         server.abort();
     }
 
@@ -21895,7 +21937,7 @@ mod tests {
             app.handle_program_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .await;
         }
-        app.handle_program_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
             .await;
 
         assert!(
@@ -21913,6 +21955,11 @@ mod tests {
         assert_eq!(
             params.get("comment").and_then(Value::as_str),
             Some("focus tests")
+        );
+        assert_eq!(
+            params.get("fork").and_then(Value::as_bool),
+            Some(false),
+            "Shift+Enter should run the selection on the main session"
         );
         server.abort();
     }
@@ -24128,6 +24175,7 @@ mod tests {
                 comment: None,
                 shimmer: None,
                 selection_block_ids: None,
+                fork: false,
             })
             .await
             .expect("execute response");

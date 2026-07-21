@@ -257,7 +257,11 @@ impl App {
         {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                 if let Some(verb) = hit_selection_verb.clone() {
-                    self.execute_program_selected_verb(verb).await;
+                    self.execute_program_selected_verb(
+                        verb,
+                        ev.modifiers.contains(KeyModifiers::SHIFT),
+                    )
+                    .await;
                 } else if hit_title_toggle {
                     self.close_program_popup().await;
                 } else if hit_title_close {
@@ -302,7 +306,11 @@ impl App {
                         .as_ref()
                         .and_then(|popup| popup.selection_menu.as_ref())
                         .map(|menu| menu.comment.clone());
-                    self.execute_program_selected_text(comment).await;
+                    self.execute_program_selected_text(
+                        comment,
+                        ev.modifiers.contains(KeyModifiers::SHIFT),
+                    )
+                    .await;
                 } else {
                     let selected = hit_selection_run.then(|| {
                         self.program_popup.as_ref().and_then(|popup| {
@@ -1101,6 +1109,7 @@ impl App {
             KeyCode::Tab => self.move_program_selection_action(1),
             KeyCode::BackTab => self.move_program_selection_action(-1),
             KeyCode::Enter => {
+                let run_on_main = key.modifiers.contains(KeyModifiers::SHIFT);
                 let action = self
                     .program_popup
                     .as_ref()
@@ -1113,12 +1122,12 @@ impl App {
                         // reload) while this row was selected — fall back to
                         // Run rather than silently doing nothing.
                         if let Some(verb) = self.program_verbs.get(idx).cloned() {
-                            self.execute_program_selected_verb(verb.name).await;
+                            self.execute_program_selected_verb(verb.name, run_on_main).await;
                         } else {
                             let comment = self.program_popup.as_ref().and_then(|popup| {
                                 Some(popup.selection_menu.as_ref()?.comment.clone())
                             });
-                            self.execute_program_selected_text(comment).await;
+                            self.execute_program_selected_text(comment, run_on_main).await;
                         }
                     }
                     ProgramSelectionAction::Comment | ProgramSelectionAction::Run => {
@@ -1126,7 +1135,7 @@ impl App {
                             .program_popup
                             .as_ref()
                             .and_then(|popup| Some(popup.selection_menu.as_ref()?.comment.clone()));
-                        self.execute_program_selected_text(comment).await;
+                        self.execute_program_selected_text(comment, run_on_main).await;
                     }
                 }
             }
@@ -1306,7 +1315,11 @@ impl App {
         };
     }
 
-    pub(super) async fn execute_program_selected_text(&mut self, comment: Option<String>) -> bool {
+    pub(super) async fn execute_program_selected_text(
+        &mut self,
+        comment: Option<String>,
+        run_on_main: bool,
+    ) -> bool {
         let selected = self.program_popup.as_ref().and_then(|popup| {
             Some((
                 Self::selected_program_text(popup)?,
@@ -1314,7 +1327,9 @@ impl App {
             ))
         });
         let Some((selection, selected_block_ids)) = selected else {
-            return self.execute_program_popup(None, None, comment).await;
+            return self
+                .execute_program_popup_target(None, None, comment, !run_on_main)
+                .await;
         };
         if let Some(popup) = self.program_popup.as_mut() {
             popup.selection = None;
@@ -1322,8 +1337,13 @@ impl App {
         }
         self.layout.program_selection_run_hit = None;
         self.layout.program_selection_verb_hits.clear();
-        self.execute_program_popup(Some(selection), Some(selected_block_ids), comment)
-            .await
+        self.execute_program_popup_target(
+            Some(selection),
+            Some(selected_block_ids),
+            comment,
+            !run_on_main,
+        )
+        .await
     }
 
     /// Run a Program selection verb (spec 0089) on the active popup's current
@@ -1332,10 +1352,14 @@ impl App {
     /// fallback — and it doesn't touch the Run-progress/pending/shimmer
     /// machinery: the daemon owns the in-flight affordance for a verb (the
     /// provisional clip annotation it applies before this call returns), and
-    /// its eventual merge arrives back through the same `program/state`
-    /// broadcast every other program-mutating call already updates the popup
-    /// from — this method does not need to poke `popup.buffer` itself.
-    pub(super) async fn execute_program_selected_verb(&mut self, verb: String) -> bool {
+    /// the fork's direct edit arrives through the same `program/state`
+    /// broadcast every other program-mutating call already uses — this method
+    /// does not need to poke `popup.buffer` itself.
+    pub(super) async fn execute_program_selected_verb(
+        &mut self,
+        verb: String,
+        run_on_main: bool,
+    ) -> bool {
         let Some(popup) = self.program_popup.as_ref() else {
             self.set_status("program verb failed: no active program".to_string());
             return false;
@@ -1390,6 +1414,8 @@ impl App {
             base_version,
             comment,
             selection_block_ids,
+            run_on_owner: run_on_main,
+            direct_edit: true,
         };
         match self.client.program_verb_execute(params).await {
             Ok(result) => {

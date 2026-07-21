@@ -526,6 +526,27 @@ impl Tui {
         }
     }
 
+    /// Poll until `needle` is no longer visible. This is useful after closing
+    /// a modal whose underlying screen already contains the next assertion's
+    /// text, so the test does not race ahead before dismissal is rendered.
+    pub async fn wait_for_absence(&self, needle: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.screen().contains(needle) {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                anyhow::bail!(
+                    "timed out after {:?} waiting for {needle:?} to disappear from TUI screen.\n\
+                     ----- last screen -----\n{}\n-----------------------",
+                    timeout,
+                    self.screen()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Block until the TUI process exits, with a timeout. Returns
     /// the wait status. Useful at end-of-test to confirm a clean
     /// shutdown rather than a hang.

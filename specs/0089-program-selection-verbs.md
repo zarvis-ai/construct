@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-07-12
 Area: architecture
-Scope: Typed refinement actions ("verbs") on a Program selection, executed as result-returning forked sessions and merged by the platform, with verb definitions loaded from markdown files.
+Scope: Typed refinement actions ("verbs") on a Program selection, executed by interactive forks that edit the owning Program directly, with verb definitions loaded from markdown files.
 
 ## Decision
 
@@ -13,11 +13,10 @@ The Program selection context menu offers, alongside Run, a set of **verbs**: ty
 
 A verb invocation follows one lifecycle:
 
-1. **Spawn.** The daemon forks the Program-owning session into a new sibling session whose first message is the verb's purpose prompt. The forked session runs the same harness as the owning session; when that harness supports native fork-resume, the verb session inherits the owning session's actual conversation state (real model memory), not merely the Program document — see "Fork, not a fresh child" below. It does **not** receive Program write capability; its jurisdiction over the selection is enforced by construction, not by prompt.
+1. **Spawn.** The daemon forks the Program-owning session into a new sibling session whose first message is the verb's purpose prompt. The forked session runs the same harness as the owning session; when that harness supports native fork-resume, the verb session inherits the owning session's actual conversation state (real model memory), not merely the Program document — see "Fork, not a fresh child" below. The fork receives the owning session id as its explicit Program write target.
 2. **Interact (optional).** Verbs declare an interaction policy. A `single-shot` verb runs to completion unattended. An `interactive` verb may hold a dialogue with the user inside its own session; the user reaches it through the session clip annotated into the Program (see below). Awaiting-input status flows to the orchestrator through the existing fleet-observation channel.
-3. **Return.** The verb session's deliverable is a structured result, not an edit: the intended effect (`annotate` or `rewrite`), an anchor identifying the selected region (block identity and/or the exact prior text), and the exact replacement or annotation markdown. The result is applied verbatim; downstream steps never paraphrase it.
-4. **Merge.** Merging is tiered. When the returned anchor still matches the current document, the platform applies the edit mechanically — no model round-trip — under the Program's existing version-conflict protection. When the document has drifted (the user edited the selection while the verb ran), the merge escalates to the Program-owning session, which re-reads the document and applies the intent with an anchored edit. Merges are serialized through a single writer so concurrent verb results cannot race each other.
-5. **Retire.** After a successful merge, or once an abandoned verb is recognized as such, the verb session is soft-archived: its transcript and session clip remain resolvable, but it leaves the active session list.
+3. **Edit.** The verb session re-reads the owning Program and applies its declared `annotate` or `rewrite` effect directly through an anchored Program edit targeted at the owning session id. It settles the selected block affordance in that edit. Concurrent document drift is handled in the fork that owns the intent: it re-reads and chooses a valid current anchor instead of enqueueing reconciliation onto the Program owner.
+4. **Retire.** The fork is an ordinary visible interactive session while it works. It is not merged back into the owner's conversation, and the owner never becomes a required second-stage document writer. Once the fork ends, it is soft-archived; its transcript and session clip remain resolvable.
 
 While a verb is in flight, the selection's blocks carry the same in-progress affordance as a selection Run (shimmer over the selected block identities), and the selection is annotated with the verb session's own session clip so provenance and interaction access live in the document.
 
@@ -28,13 +27,13 @@ A verb session is a **visible top-level sibling** of the Program-owning session,
 - When the owning session's harness has a native fork-resume primitive (as of this writing: claude, codex, grok), the verb session's underlying harness process resumes the owning session's actual conversation — the model's own memory, not a summary or a copy. Harnesses without a native primitive (smith, shell, antigravity, and any cross-harness case) get an ordinary fresh start; the verb's prompt always carries the full Program document as context regardless (bounded in size, with a live read tool as fallback for anything truncated or for a document that changed since), so there is no *hard* dependency on native fork for a verb to be useful.
 - Either way, the verb's own purpose prompt is still the first new instruction the session receives: a resumed conversation remembers the past but still needs to be told what to do *now*.
 - Forking (over a bare spawn with no lineage) was chosen specifically so a harness capable of native resume can give the verb everything the owning session already knows — prior decisions, files read, established conventions — not just the document text.
-- Visibility is an accepted tradeoff: the verb session appears in the fleet like any other session while it runs, grouped alongside the Program-owning session. It is retired (soft-archived) the same as before once its result merges or it is abandoned, so it does not linger once its job is done.
+- Visibility is an accepted tradeoff: the verb session appears in the fleet like any other session while it runs, grouped alongside the Program-owning session. It is soft-archived when it ends, so it does not linger once its job is done.
 
 ### Optimistic and confirmed shimmer
 
 Shimmer on a verb's selected block(s) requires an active `ProgramRunProgress` entry to exist for the Program-owning session before any per-block shimmer declaration can take effect — a declaration made against a session with no active run is silently dropped, not a fallback error. Verb execution must seed this the same way selection Run does, before applying its own shimmer declaration. Clients give the same optimistic, pre-round-trip shimmer treatment to a verb dispatch that they give to a selection Run: the client marks the affected block(s) pending locally the instant the verb is dispatched, before the daemon round-trip completes, unioned with (not clobbering) any run already active on that session.
 
-Every terminal outcome of a verb settles that shimmer explicitly — mechanical merge, drift escalation, and abandonment alike. Content-identity churn cannot be relied on to do it implicitly: an `annotate` merge keeps the anchor blocks' text (and therefore their identity) alive, so without an explicit settle they would shimmer forever after the verb completed, and a partially drifted multi-block anchor can leave some blocks' identities intact and still pending. The settle covers the whole anchor, not just its first block, and only the merge itself may change document text — settling shimmer never does. Declarations naming blocks whose identity already drifted are ignored (fail closed). On drift escalation the verb's shimmer settles too: the verb's own work is complete, and the Program-owning session re-declares shimmer through its reconciling edit if work remains in flight.
+The direct edit settles the verb's affected refs. If the fork exits or errors before completing that edit, daemon-side terminal cleanup settles the original anchor without changing document text. Content-identity churn cannot be relied on to do this implicitly: an `annotate` edit may keep the anchor blocks' identity alive. Declarations naming blocks whose identity already drifted are ignored (fail closed).
 
 ### Verb effects
 
@@ -43,7 +42,7 @@ Every terminal outcome of a verb settles that shimmer explicitly — mechanical 
 
 Both effects must preserve session/harness clips that appear inside the selection unless removing them is the explicit purpose of the verb invocation; a rewrite that silently destroys dispatch provenance is a defect.
 
-The free-text instruction field defined for selection Run composes with verbs: a verb plus a non-empty instruction appends the instruction to the verb's purpose prompt. It never replaces the verb.
+The free-text instruction field defined for selection Run composes with verbs: a verb plus a non-empty instruction appends the instruction to the verb's purpose prompt. It never replaces the verb. Verbs use the fork by default. Shift+Enter or Shift+click delivers the verb prompt to the Program-owning session instead; while Shift is held, the menu labels and focused-row description preview the main-session destination.
 
 ### Verb definitions are data
 
@@ -52,9 +51,9 @@ A verb is defined entirely by a markdown file:
 - **Frontmatter** declares the verb's identity and policies: an optional stable kebab-case `name` (defaults to the definition file's own filename stem when omitted — a file `threat-model.md` needs no `name:` line to be named `threat-model`; an explicit `name:` still wins when present, which is how a differently-named file overrides another verb), a short human `label` for menu display, the `effect` (`annotate` | `rewrite`), the `interaction` policy (`single-shot` | `interactive`), a one-line `description`, an optional `order` hint for menu sorting, and an optional `comment` — free-text documentation for people reading the file (provenance, attribution, maintenance notes) that never becomes part of the verb or its prompt. Attribution for the built-ins lives in `comment`, not in the prompt: the model doesn't need to be told where its instructions were adapted from.
 
 When a client's menu is keyboard-focused and cycling Up/Down between Comment, Run, and each verb, the currently highlighted row's description shows on the menu, wrapped (never truncated with an ellipsis) across as many lines as it needs. Run and Comment carry fixed descriptions of their own; a verb's is always led by its declared `effect` — "Annotate: " or "Rewrite: " — derived from the structured field itself, never trusted to appear correctly in the author's free text, so the description can never disagree with what the verb is actually about to do to the document. The `description` frontmatter field should therefore read as a lowercase continuation clause after that prefix (e.g. `surface hidden assumptions…`, not `Surface hidden assumptions…` or `Annotate hidden assumptions…`) — the effect word is supplied automatically and must not be repeated.
-- **Body** is the purpose prompt handed to the verb session, together with the standing contract text (selection jurisdiction, clip preservation, structured-return format).
+- **Body** is the purpose prompt handed to the verb session, together with the standing contract text (selection jurisdiction, clip preservation, explicit owner target, and direct anchored-edit requirements).
 
-The body may reference **template variables** as `{{ var }}` placeholders: `{{ program.content }}` (the Program document, subject to the same inline-size bounding as the default framing, with a pointer to the live read tool when truncated), `{{ program.selected_text }}` (the selection), and `{{ program.additional_instruction }}` (the free-text instruction, empty when none was given). A referenced variable is substituted in place at prompt-build time and **suppresses the corresponding default framing section** — an author who positions the document, selection, or instruction themselves never gets it appended a second time. Unreferenced variables keep the default framing, so a body with no placeholders behaves exactly as before. A `{{ ... }}` placeholder naming anything other than a known variable makes the file malformed (skipped with a diagnostic): a typo'd variable must fail loudly at load time, not silently reach the model as literal text. The structured-return contract is not templatable; it is always appended.
+The body may reference **template variables** as `{{ var }}` placeholders: `{{ program.content }}` (the Program document, subject to the same inline-size bounding as the default framing, with a pointer to the live read tool when truncated), `{{ program.selected_text }}` (the selection), and `{{ program.additional_instruction }}` (the free-text instruction, empty when none was given). A referenced variable is substituted in place at prompt-build time and **suppresses the corresponding default framing section** — an author who positions a value never gets it twice. Unreferenced variables keep the default framing. A `{{ ... }}` placeholder naming anything other than a known variable makes the file malformed (skipped with a diagnostic). The direct-edit contract is not templatable; it is always appended.
 
 Built-in verbs ship embedded in the daemon. Users add or override verbs by placing definition files in a `verbs/` directory under the construct configuration directory; a user file with the same `name` as a built-in replaces it. Adding a verb requires no code change in any client: clients render the selection menu from the daemon's advertised verb list, so a new definition file appears in every client's menu. Malformed definition files are skipped with a diagnostic, never a crash.
 
@@ -71,26 +70,23 @@ Four built-ins ship, adapted from the persona prompts of the MIT-licensed Ourobo
 
 ## Reason
 
-The Program document is orchestration state; its quality gates everything dispatched from it. Ouroboros demonstrates that spec-refinement moves (challenge, simplify, crystallize, interview) are effective when encoded as small single-purpose persona prompts. Mapping each verb to a result-returning session fits this system's existing grain: sessions already give interactive verbs a place to hold a dialogue, the document already annotates dispatched work with session clips, and forking is the system's existing primitive for "continue this elsewhere with everything you already know."
+The Program document is orchestration state; its quality gates everything dispatched from it. Ouroboros demonstrates that spec-refinement moves (challenge, simplify, crystallize, interview) are effective when encoded as small single-purpose persona prompts. Mapping each verb to a forked session fits this system's existing grain: sessions give interactive verbs a place to hold a dialogue, and forking is the existing primitive for "continue this elsewhere with everything you already know."
 
-Keeping write capability out of the verb session makes selection jurisdiction a guarantee instead of a convention, prevents a confused agent from clobbering concurrent human edits, and collapses the concurrent-verbs problem into single-writer merge serialization. The tiered merge keeps the common case (document unchanged) free of any model round-trip, consistent with the mechanical-fast-path philosophy of 0066.
+Giving the fork the owner's Program id removes the owner from the completion critical path. A long-running owner turn can no longer delay a finished verb's document update. Anchored edits retain the existing concurrency protection while keeping reconciliation with the fork that has the verb's full intent and interactive context.
 
 Verb definitions as markdown files keep the surface extensible without client releases: the useful verb set is expected to grow and to be personal, and each verb is precisely a prompt plus a small policy tuple — data, not code.
 
 ## Consequences
 
 - Clients must render the verb menu from the daemon's advertised list rather than hardcoding entries; adding a definition file must be sufficient to surface a verb everywhere.
-- The structured-return contract (effect, anchor, exact content) is a compatibility surface between verb sessions and the merge path; changes to it must keep existing verb definitions working.
-- Verb results are applied verbatim. Any future step that summarizes, reformats, or "improves" a returned rewrite before merging violates this spec.
-- Mechanical merge must remain subordinate to the Program's version-conflict protection; escalation to the Program-owning session is the only sanctioned response to anchor drift, and merges stay single-writer.
-- Overlapping in-flight verbs on intersecting selections are permitted but must be surfaced to the user (at minimum a warning at spawn time); later results merge against the post-merge document, and escalation handles the drift.
-- Verb sessions that die or are cancelled before returning must clear the in-progress affordance and leave the document untouched. More generally, every terminal path — merged, drift-escalated, or abandoned — settles the verb's shimmer over the full anchor (see "Optimistic and confirmed shimmer").
-- Soft-archived verb sessions must keep their clips resolvable, since the clip in the document is the durable record of the interaction.
+- Direct verb edits remain subordinate to the Program's anchored-edit and version-conflict protection. A fork must re-read on drift and must never ask the owner to perform a delayed merge on its behalf.
+- Overlapping in-flight verbs on intersecting selections are permitted; each fork reconciles against the live document immediately before its own anchored edit.
+- Verb sessions that die or are cancelled before editing must clear the in-progress affordance and leave the document untouched. Terminal cleanup settles the verb's shimmer over the full original anchor.
 - A verb session is `SessionKind::User` with `parent_session_id: None`, matching every other fork — never `SessionKind::Subagent` with `forked_from` also set. That combination is deliberately avoided: the lineage tree and the session-reorder logic disagree on which relationship takes precedence when both are set on the same session, so it is not a supported shape.
 
 ## Non-Goals
 
-- Hard, capability-level enforcement that a merge touches only the selected blocks (v1 relies on the structured return plus mechanical anchoring).
+- Hard, capability-level enforcement that a direct edit touches only the selected blocks (the prompt contract plus anchored edit defines jurisdiction).
 - A quantitative ambiguity-scoring pipeline or score-gated Run (a possible later layer; the interview verb self-assesses informally).
 - Multi-persona debate panels (Ouroboros "unstuck") and evaluation/QA verbs over Run results — future verb candidates, not v1.
 - Changing Run itself; the execute family and 0066 fast-path semantics are untouched.
@@ -99,9 +95,9 @@ Verb definitions as markdown files keep the surface extensible without client re
 
 ## Examples
 
-A user selects a loose paragraph describing a deploy plan and picks **Crystallize**. The blocks shimmer immediately (client-optimistic, then daemon-confirmed); a new visible session — forked from the Program-owning session, with its native conversation if the harness supports it — appears with a session clip by the selection. It returns a rewrite containing a goal line, two constraints, and four acceptance criteria; the document hasn't changed meanwhile, so the daemon applies it mechanically and the verb session is archived. The clip remains as provenance.
+A user selects a loose paragraph describing a deploy plan and picks **Crystallize**. The blocks shimmer immediately (client-optimistic, then daemon-confirmed); a new visible session — forked from the Program-owning session, with its native conversation if the harness supports it — appears with a session clip by the selection. It re-reads the owner's Program and writes a goal line, two constraints, and four acceptance criteria directly into that document without waiting for the owner.
 
-A user picks **Interview** on a vague feature section, then keeps editing elsewhere. The interview session asks one question at a time; the user enters it through the clip and answers over ten minutes. The returned decision digest is annotated under the (meanwhile edited) section — the anchor drifted, so the Program-owning session places it with an anchored edit rather than the mechanical path.
+A user picks **Interview** on a vague feature section, then keeps editing elsewhere. The interview session asks one question at a time and the user answers over ten minutes. Before annotating its decision digest, the fork re-reads the meanwhile-edited Program and applies the digest itself at a current anchor; no owner-session turn is queued.
 
 A user drops `verbs/threat-model.md` in the construct config directory with `effect: annotate`, `interaction: single-shot`, and a purpose prompt asking for abuse cases. On the next selection, every client's menu shows **Threat model** with no client or daemon code change.
 

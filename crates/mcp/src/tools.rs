@@ -1233,6 +1233,7 @@ pub async fn call(
                 comment: None,
                 shimmer,
                 selection_block_ids: None,
+                fork: false,
             };
             let result = client.program_execute(params).await?;
             let mut out = serde_json::Map::new();
@@ -1268,6 +1269,8 @@ pub async fn call(
                 base_version: args.get("base_version").and_then(|v| v.as_u64()),
                 comment: arg_str(&args, "comment").ok(),
                 selection_block_ids: None,
+                run_on_owner: false,
+                direct_edit: false,
             };
             let result = client.program_verb_execute(params).await?;
             let changed: Vec<Value> = compact_program_blocks(

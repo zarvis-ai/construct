@@ -619,6 +619,18 @@ fn program_execution_prompt_with_comment(comment: Option<&str>) -> String {
     prompt
 }
 
+fn forked_program_execution_prompt(owner_session_id: &str, comment: Option<&str>) -> String {
+    let mut prompt = program_execution_prompt_with_comment(comment);
+    prompt.push_str(&format!(
+        "\n\nYou are running in an interactive fork. The Program you must read and update belongs \
+         to session `{owner_session_id}`. Always pass `session_id: \"{owner_session_id}\"` to \
+         construct_program_get and every construct_program_edit/update call; do not edit a \
+         Program belonging to this fork. Apply progress and results directly to that owner \
+         document as you work. Do not return a result for the owner to merge."
+    ));
+    prompt
+}
+
 /// A Program-verb session awaiting a structured result to merge back into
 /// its owning Program (spec 0089), tracked from the moment its provisional
 /// clip-annotation edit lands until either a mechanical merge or an
@@ -682,6 +694,7 @@ fn program_verb_prompt(
     full_document: &str,
     selection: &str,
     comment: Option<&str>,
+    direct_target: Option<(&str, &str)>,
 ) -> String {
     use crate::program_verbs::{
         prompt_references_var, render_verb_prompt, TEMPLATE_VAR_ADDITIONAL_INSTRUCTION,
@@ -758,10 +771,10 @@ fn program_verb_prompt(
     }
     match verb.interaction {
         ProgramVerbInteraction::Interactive => prompt.push_str(
-            "This is an interactive verb: do not write a result yet. Hold a focused dialogue \
+            "This is an interactive verb: do not make the final document edit yet. Hold a focused dialogue \
              with the user in this session first, following the questioning approach above, \
-             until you have enough to produce a result. Only once you decide to stop should \
-             you write the result described below.\n\n",
+             until you have enough to finish. Only once you decide to stop should \
+             you perform the completion action described below.\n\n",
         ),
         ProgramVerbInteraction::SingleShot => {
             prompt.push_str("Produce your result now without asking the user anything.\n\n")
@@ -773,18 +786,44 @@ fn program_verb_prompt(
         }
         ProgramVerbEffect::Rewrite => "the complete replacement Markdown for the selection",
     };
-    prompt.push_str(&format!(
-        "You may read this Program document (agentd_program_get / construct_program_get) but \
-         have no tool, native or MCP, that can edit it — do not attempt to use \
-         construct_program_edit, agentd_program_edit, or any similar tool; the platform applies \
-         your result on your behalf once you deliver it. When you are ready, \
-         call agentd_context (or construct_context if you are using MCP) and read \
-         `session_widgets.dir` from the response, then write a single JSON object to \
-         `<that dir>/verb-result.json` with exactly one field, `content`: {content_meaning}. \
-         Preserve any @{{session:...}} or @{{harness:...}} smart clips present in the \
-         selection unless removing one is this verb's explicit purpose. Keep the result \
-         focused; do not pad it."
-    ));
+    if let Some((target_session_id, live_anchor)) = direct_target {
+        let edit_requirement = match verb.effect {
+            ProgramVerbEffect::Annotate => {
+                "the live anchor unchanged, followed by only the new annotation Markdown"
+            }
+            ProgramVerbEffect::Rewrite => {
+                "the complete replacement Markdown for the selection, retaining the provenance session clip from the live anchor"
+            }
+        };
+        prompt.push_str(&format!(
+            "Update the Program directly when ready; do not return a result for another session \
+             to merge. Read the latest document with session_id `{target_session_id}`, then call \
+             construct_program_edit (or agentd_program_edit) with that same explicit session_id. \
+             Your anchored old_string is initially the exact Markdown below (re-read and choose \
+             sufficient surrounding context if concurrent edits changed it):\n\n{live_anchor}\n\nFor this \
+             `{effect}` verb, the edit's new_string must contain {edit_requirement}. Settle the \
+             affected block refs in the same edit. Preserve any @{{session:...}} or \
+             @{{harness:...}} smart clips unless removing one is this verb's explicit purpose. \
+             Keep the edit focused; do not pad it.",
+            effect = match verb.effect {
+                ProgramVerbEffect::Annotate => "annotate",
+                ProgramVerbEffect::Rewrite => "rewrite",
+            }
+        ));
+    } else {
+        prompt.push_str(&format!(
+            "You may read this Program document (agentd_program_get / construct_program_get) but \
+             have no tool, native or MCP, that can edit it — do not attempt to use \
+             construct_program_edit, agentd_program_edit, or any similar tool; the platform applies \
+             your result on your behalf once you deliver it. When you are ready, \
+             call agentd_context (or construct_context if you are using MCP) and read \
+             `session_widgets.dir` from the response, then write a single JSON object to \
+             `<that dir>/verb-result.json` with exactly one field, `content`: {content_meaning}. \
+             Preserve any @{{session:...}} or @{{harness:...}} smart clips present in the \
+             selection unless removing one is this verb's explicit purpose. Keep the result \
+             focused; do not pad it."
+        ));
+    }
     prompt
 }
 
@@ -2554,6 +2593,63 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Create a visible interactive same-harness fork positioned beside its
+    /// Program owner. Prompt delivery is deliberately separate so callers can
+    /// seed owner-side Program state before the fork starts acting.
+    async fn create_program_execution_fork(
+        self: &Arc<Self>,
+        owner_session_id: &str,
+        title: String,
+    ) -> Result<String> {
+        let entry = self
+            .get_entry(owner_session_id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {owner_session_id}"))?;
+        let (cwd, harness, group_id, busy_ms, message_count, tokens) = {
+            let summary = entry.summary.read().await;
+            let now_ms = Utc::now().timestamp_millis();
+            (
+                summary.cwd.clone(),
+                summary.harness.clone(),
+                summary.group_id.clone(),
+                summary.busy_ms_at(now_ms),
+                summary.message_count,
+                summary.tokens,
+            )
+        };
+        let transcript_seq = self
+            .storage
+            .read_transcript(owner_session_id, 0, None)?
+            .events
+            .len() as u64;
+        self.create(CreateSessionParams {
+            harness,
+            cwd,
+            prompt: None,
+            model: None,
+            title: Some(title),
+            mode: Some("interactive".to_string()),
+            pty_size: Some(PtySize { cols: 100, rows: 30 }),
+            worktree: false,
+            env: HashMap::new(),
+            args: Vec::new(),
+            kind: construct_protocol::SessionKind::User,
+            parent_session_id: None,
+            group_id,
+            position_after_session_id: Some(owner_session_id.to_string()),
+            forked_from: Some(construct_protocol::ForkedFrom {
+                session_id: owner_session_id.to_string(),
+                transcript_seq,
+                at_ms: Utc::now().timestamp_millis(),
+                parent_busy_ms: busy_ms,
+                parent_message_count: message_count,
+                parent_tokens: tokens,
+                is_reset_snapshot: false,
+            }),
+        })
+        .await
+    }
+
     pub async fn program_execute(
         self: &Arc<Self>,
         params: ProgramExecuteParams,
@@ -2635,13 +2731,25 @@ impl SessionManager {
         };
         let run_context = program_run_context(&result.program, scope, body);
         self.write_program_run_context(&params.session_id, &run_context)?;
-        let prompt = program_execution_prompt_with_comment(run_comment);
-        let queued_behind_current_turn = {
-            let summary = entry.summary.read().await;
-            summary.state == construct_protocol::SessionState::Running
+        let (execution_session_id, prompt, queued_behind_current_turn) = if params.fork {
+            let fork_id = self
+                .create_program_execution_fork(&params.session_id, "program selection run".into())
+                .await?;
+            // The fork's own context env points at this sidecar. Store the
+            // owner's Program context there before delivering the first turn.
+            self.write_program_run_context(&fork_id, &run_context)?;
+            let prompt = forked_program_execution_prompt(&params.session_id, run_comment);
+            self.deliver_text_to_session(&fork_id, &prompt).await?;
+            (fork_id, prompt, false)
+        } else {
+            let prompt = program_execution_prompt_with_comment(run_comment);
+            let queued = {
+                let summary = entry.summary.read().await;
+                summary.state == construct_protocol::SessionState::Running
+            };
+            self.deliver_text_to_session(&params.session_id, &prompt).await?;
+            (params.session_id.clone(), prompt, queued)
         };
-        self.deliver_text_to_session(&params.session_id, &prompt)
-            .await?;
         let active_run = self.start_program_run_with_dispatch_state(
             &params.session_id,
             &run_body,
@@ -2657,6 +2765,7 @@ impl SessionManager {
             prompt,
             active_run,
             blocks,
+            execution_session_id: Some(execution_session_id),
         })
     }
 
@@ -2760,6 +2869,7 @@ impl SessionManager {
             prompt: String::new(),
             active_run: edit_result.active_run,
             blocks: edit_result.blocks,
+            execution_session_id: None,
         })
     }
 
@@ -2816,18 +2926,34 @@ impl SessionManager {
             .map(str::trim)
             .filter(|c| !c.is_empty());
 
-        let (owner_cwd, owner_harness, owner_group_id, owner_busy_ms, owner_message_count, owner_tokens) = {
-            let summary = entry.summary.read().await;
-            let now_ms = Utc::now().timestamp_millis();
-            (
-                summary.cwd.clone(),
-                summary.harness.clone(),
-                summary.group_id.clone(),
-                summary.busy_ms_at(now_ms),
-                summary.message_count,
-                summary.tokens,
-            )
-        };
+        if params.direct_edit && params.run_on_owner {
+            self.start_program_run_with_dispatch_state(
+                &params.session_id,
+                &params.selection,
+                true,
+                None,
+                entry.summary.read().await.state == construct_protocol::SessionState::Running,
+                params.selection_block_ids.as_deref(),
+            );
+            let prompt = program_verb_prompt(
+                &verb,
+                &params.session_id,
+                &program.markdown,
+                selection_trimmed,
+                comment,
+                Some((&params.session_id, &params.selection)),
+            );
+            self.deliver_text_to_session(&params.session_id, &prompt).await?;
+            self.broadcast_program_state(program.clone());
+            let blocks = self.program_blocks_projection(&params.session_id, &program.markdown);
+            return Ok(ProgramVerbExecuteResult {
+                program,
+                subagent_session_id: params.session_id,
+                verb: verb.name,
+                blocks,
+            });
+        }
+
         // Fork, not a fresh child (spec 0089): when the owning session's
         // harness supports native fork-resume (currently claude, codex,
         // opencode, grok — see `Self::native_id_file_name`), spawning with the same
@@ -2840,65 +2966,8 @@ impl SessionManager {
         // way the verb's own prompt (built below, full document + selection)
         // is still the instruction for *this* turn — a resumed conversation
         // remembers the past but still needs to be told what to do now.
-        let transcript_seq = self
-            .storage
-            .read_transcript(&params.session_id, 0, None)?
-            .events
-            .len() as u64;
-        let mut env = HashMap::new();
-        env.insert(
-            "CONSTRUCT_PARENT_SESSION_ID".to_string(),
-            params.session_id.clone(),
-        );
-        let prompt = program_verb_prompt(
-            &verb,
-            &params.session_id,
-            &program.markdown,
-            selection_trimmed,
-            comment,
-        );
         let verb_session_id = self
-            .create(CreateSessionParams {
-                // Same harness as the Program-owning session, not a
-                // hardcoded "smith": many users only have their own harness
-                // (claude/codex/…) configured, and a verb session should
-                // work everywhere a normal session does. Interactive (PTY)
-                // rather than headless: the `interview` verb needs a real
-                // multi-turn dialogue, and headless invocation shape varies
-                // enough across wrapper adapters that PTY mode is the more
-                // uniformly supported one anyway.
-                harness: owner_harness,
-                cwd: owner_cwd,
-                prompt: Some(prompt),
-                model: None,
-                title: Some(format!("verb:{}", verb.name)),
-                mode: Some("interactive".to_string()),
-                pty_size: Some(PtySize {
-                    cols: 100,
-                    rows: 30,
-                }),
-                worktree: false,
-                env,
-                args: Vec::new(),
-                // A fork is a visible top-level sibling, not a hidden
-                // subagent (matches how every other fork in the fleet
-                // renders — `Client::fork_session`'s own shape). It's
-                // archived once its result merges or the verb is abandoned,
-                // so it doesn't linger once its job is done.
-                kind: construct_protocol::SessionKind::User,
-                parent_session_id: None,
-                group_id: owner_group_id,
-                position_after_session_id: Some(params.session_id.clone()),
-                forked_from: Some(construct_protocol::ForkedFrom {
-                    session_id: params.session_id.clone(),
-                    transcript_seq,
-                    at_ms: Utc::now().timestamp_millis(),
-                    parent_busy_ms: owner_busy_ms,
-                    parent_message_count: owner_message_count,
-                    parent_tokens: owner_tokens,
-                    is_reset_snapshot: false,
-                }),
-            })
+            .create_program_execution_fork(&params.session_id, format!("verb:{}", verb.name))
             .await?;
 
         // Seed the run's pending set over the verb's selection before the
@@ -2958,6 +3027,44 @@ impl SessionManager {
             }
         };
 
+        let prompt = program_verb_prompt(
+            &verb,
+            &params.session_id,
+            &program.markdown,
+            selection_trimmed,
+            comment,
+            params
+                .direct_edit
+                .then_some((params.session_id.as_str(), anchor.as_str())),
+        );
+
+        if params.direct_edit {
+            if let Err(e) = self.deliver_text_to_session(&verb_session_id, &prompt).await {
+                let _ = self.archive(&verb_session_id).await;
+                return Err(e);
+            }
+            self.pending_verb_merges.lock().unwrap().insert(
+                verb_session_id.clone(),
+                PendingVerbMerge {
+                    program_session_id: params.session_id.clone(),
+                    verb: verb.clone(),
+                    anchor: anchor.clone(),
+                    // Sentinel path: direct writers never receive it, so
+                    // terminal cleanup can only settle/retire, never merge.
+                    result_file: self
+                        .storage
+                        .widgets_dir(&verb_session_id)
+                        .join("direct-edit-no-merge"),
+                },
+            );
+            return Ok(ProgramVerbExecuteResult {
+                program: edit_result.program,
+                subagent_session_id: verb_session_id,
+                verb: verb.name,
+                blocks: edit_result.blocks,
+            });
+        }
+
         self.pending_verb_merges.lock().unwrap().insert(
             verb_session_id.clone(),
             PendingVerbMerge {
@@ -2970,6 +3077,14 @@ impl SessionManager {
                     .join("verb-result.json"),
             },
         );
+        if let Err(e) = self.deliver_text_to_session(&verb_session_id, &prompt).await {
+            self.pending_verb_merges
+                .lock()
+                .unwrap()
+                .remove(&verb_session_id);
+            let _ = self.archive(&verb_session_id).await;
+            return Err(e);
+        }
 
         Ok(ProgramVerbExecuteResult {
             program: edit_result.program,
@@ -4953,7 +5068,14 @@ mod tests {
     fn program_verb_prompt_includes_full_document_as_context() {
         let verb = test_verb_for_prompt(construct_protocol::ProgramVerbEffect::Rewrite);
         let doc = "# Plan\n\nSection A.\n\nSection B: do the thing.\n\nSection C.\n";
-        let prompt = program_verb_prompt(&verb, "owner1", doc, "Section B: do the thing.", None);
+        let prompt = program_verb_prompt(
+            &verb,
+            "owner1",
+            doc,
+            "Section B: do the thing.",
+            None,
+            None,
+        );
         assert!(
             prompt.contains("Section A.") && prompt.contains("Section C."),
             "full document, not just the selection, must appear in the prompt: {prompt}"
@@ -4983,6 +5105,7 @@ mod tests {
             doc,
             "Section B: do the thing.",
             Some("keep it short"),
+            None,
         );
         assert!(
             prompt.contains("Given this document:\n# Plan"),
@@ -5021,7 +5144,14 @@ mod tests {
     fn program_verb_prompt_truncates_oversized_document_with_a_pointer() {
         let verb = test_verb_for_prompt(construct_protocol::ProgramVerbEffect::Annotate);
         let huge_doc = "x".repeat(PROGRAM_VERB_INLINE_DOC_MAX_CHARS + 5_000);
-        let prompt = program_verb_prompt(&verb, "owner42", &huge_doc, "selected bit", None);
+        let prompt = program_verb_prompt(
+            &verb,
+            "owner42",
+            &huge_doc,
+            "selected bit",
+            None,
+            None,
+        );
         assert!(
             prompt.contains("truncated"),
             "oversized document must be flagged as truncated: {prompt}"
@@ -5034,6 +5164,24 @@ mod tests {
             prompt.len() < huge_doc.len() + 2_000,
             "prompt must not embed the full oversized document"
         );
+    }
+
+    #[test]
+    fn direct_program_verb_prompt_targets_owner_and_forbids_return_merge() {
+        let verb = test_verb_for_prompt(construct_protocol::ProgramVerbEffect::Rewrite);
+        let prompt = program_verb_prompt(
+            &verb,
+            "owner-direct",
+            "# Plan\n\nold text @{session:fork1}",
+            "old text",
+            None,
+            Some(("owner-direct", "old text @{session:fork1}")),
+        );
+        assert!(prompt.contains("Update the Program directly"));
+        assert!(prompt.contains("session_id `owner-direct`"));
+        assert!(prompt.contains("old text @{session:fork1}"));
+        assert!(prompt.contains("do not return a result"));
+        assert!(!prompt.contains("verb-result.json"));
     }
 
     #[test]
@@ -10258,6 +10406,7 @@ done
                 comment: None,
                 shimmer: None,
                 selection_block_ids: None,
+                fork: false,
             })
             .await
             .expect("execute");

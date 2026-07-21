@@ -525,6 +525,17 @@ impl App {
         selected_block_ids: Option<HashSet<String>>,
         comment: Option<String>,
     ) -> bool {
+        self.execute_program_popup_target(selection, selected_block_ids, comment, false)
+            .await
+    }
+
+    pub(super) async fn execute_program_popup_target(
+        &mut self,
+        selection: Option<String>,
+        selected_block_ids: Option<HashSet<String>>,
+        comment: Option<String>,
+        fork: bool,
+    ) -> bool {
         let Some(session_id) = self
             .program_popup
             .as_ref()
@@ -677,6 +688,7 @@ impl App {
             // pass sees user-edited blocks.
             shimmer,
             selection_block_ids,
+            fork,
         };
         match self.client.program_execute(params).await {
             Ok(result) => {

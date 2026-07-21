@@ -1720,6 +1720,10 @@ pub struct ProgramExecuteParams {
     /// for older clients and callers (e.g. the MCP tool) that don't send it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_block_ids: Option<Vec<String>>,
+    /// Execute in a new interactive fork of the Program-owning session.
+    /// Older clients omit this and retain owner-session execution.
+    #[serde(default)]
+    pub fork: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1731,6 +1735,10 @@ pub struct ProgramExecuteResult {
     /// Per-block projection of the program after the run was seeded (spec 0053).
     #[serde(default)]
     pub blocks: Vec<ProgramBlockView>,
+    /// The session that received the Run prompt. Present for both forked and
+    /// owner-session execution so clients can identify the worker uniformly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1801,6 +1809,14 @@ pub struct ProgramVerbExecuteParams {
     pub comment: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_block_ids: Option<Vec<String>>,
+    /// Deliver the verb prompt to the Program owner instead of creating a
+    /// fork. This is the explicit Shift-modified escape hatch in the TUI.
+    #[serde(default)]
+    pub run_on_owner: bool,
+    /// Let the executing session edit the owner's Program directly instead
+    /// of returning a structured result for daemon-side merge.
+    #[serde(default)]
+    pub direct_edit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
