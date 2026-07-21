@@ -9,6 +9,10 @@ A **fleet** is the set of sessions managed by one construct daemon. For example,
 you can keep a shell running tests, ask Codex to implement a fix, ask Claude to
 review it, and use smith as the built-in coordinator.
 
+Contributing a new harness, or closing a feature gap in an existing one? The
+developer-facing integration checklist lives in
+[adding-a-harness.md](adding-a-harness.md).
+
 ## Which harness should I use?
 
 | Harness | What it is | Use it when |
