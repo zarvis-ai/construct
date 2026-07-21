@@ -570,7 +570,8 @@ impl SessionManager {
             text,
         } = &event
         {
-            self.maybe_spawn_auto_title(entry.clone(), text.clone());
+            self.maybe_spawn_auto_title(entry.clone(), text.clone())
+                .await;
         }
 
         let _ = self
@@ -626,6 +627,7 @@ impl SessionManager {
                 harness: owner_summary.harness.clone(),
                 cwd: owner_summary.cwd.clone(),
                 title: title.clone(),
+                auto_title_pending: false,
                 state,
                 created_at: now,
                 last_event_at: None,

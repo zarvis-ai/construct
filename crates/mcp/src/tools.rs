@@ -2210,6 +2210,7 @@ mod tests {
             harness: "codex".to_string(),
             cwd: "/tmp".to_string(),
             title: None,
+            auto_title_pending: false,
             state: SessionState::Running,
             created_at: "2026-05-24T00:00:00Z".parse().expect("timestamp"),
             last_event_at: None,

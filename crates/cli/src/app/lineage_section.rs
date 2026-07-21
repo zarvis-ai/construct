@@ -362,6 +362,7 @@ mod tests {
             harness: "smith".into(),
             cwd: "/tmp".into(),
             title: None,
+            auto_title_pending: false,
             state: construct_protocol::SessionState::Running,
             created_at: chrono::Utc::now(),
             last_event_at: None,

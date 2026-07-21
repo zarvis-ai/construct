@@ -81,7 +81,7 @@ impl SessionManager {
                 } else if !entry.title_gen_attempted.load(Ordering::SeqCst)
                     && line.chars().count() >= 2
                 {
-                    self.maybe_spawn_auto_title(entry.clone(), line);
+                    self.maybe_spawn_auto_title(entry.clone(), line).await;
                 }
             }
         }
