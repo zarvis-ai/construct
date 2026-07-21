@@ -34047,6 +34047,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lineage_section_appears_after_the_first_message() {
+        let (mut app, _dir, server) = captured_app().await;
+        let selected = app.selected_id().expect("selected session");
+        app.sessions
+            .iter_mut()
+            .find(|session| session.id == selected)
+            .expect("selected session summary")
+            .message_count = 1;
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+
+        assert!(
+            app.layout.lineage_area.is_some(),
+            "a session with a message gets a lineage section even before it forks"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn lineage_section_renders_below_the_session_rows() {
         let (mut app, _dir, server) = test_app_with_lineage().await;
         app.select_session("s1".to_string());

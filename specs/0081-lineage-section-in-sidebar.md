@@ -17,13 +17,15 @@ superseded). It is a master–detail pattern: the section follows the list
 selection like a detail panel, with the selected session's node highlighted
 in the diagram.
 
-Visibility is automatic, not user-armed: the section appears whenever the
-selected session has lineage to show (more than its own lone node) and
-disappears entirely otherwise — no hover trigger, no pin, no per-session
-open state. A session's own upward links count as lineage too: selecting a
-subagent (or a fork) keeps the section on screen showing its parent's
-tree. The section never squeezes the session rows below their minimum
-height and never takes more than half the rows region — a deep tree
+Visibility is automatic, not user-armed: the section appears once the
+selected session has at least one recorded message, even when its tree is
+still a lone node, or whenever the session has lineage to show (more than its
+own lone node). It disappears entirely only for an empty session without
+lineage — no hover trigger, no pin, no per-session open state. A session's own
+upward links count as lineage too: selecting a subagent (or a fork) keeps the
+section on screen showing its parent's tree. The section never squeezes the
+session rows below their minimum height and never takes more than half the
+rows region — a deep tree
 scrolls (vertically and horizontally) inside the section instead of
 crowding the list out — and keeps one blank padding row above and below
 the diagram. When the diagram overflows the section's width, the

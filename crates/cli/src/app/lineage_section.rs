@@ -9,10 +9,10 @@
 //! merge-and-archive, `Esc` backs out) carry over unchanged; what changed is
 //! where the surface lives and how it's entered:
 //!
-//! - The section renders whenever the selected session has lineage to show —
-//!   no hover trigger, no pin. It follows the list selection like a detail
-//!   panel (master–detail), and a click on its header collapses it to just
-//!   that header row.
+//! - The section renders once the selected session has at least one message,
+//!   or whenever it has lineage to show — no hover trigger, no pin. It follows
+//!   the list selection like a detail panel (master–detail), and a click on its
+//!   header collapses it to just that header row.
 //! - `Tab`, while the list pane holds focus, moves keyboard focus between
 //!   the session rows and the lineage section.
 
@@ -21,12 +21,22 @@ use crate::lineage::LineageRow;
 
 impl App {
     /// The session whose lineage the sidebar section shows: the selected
-    /// session, when it actually has fork/subagent lineage to draw
-    /// (`crate::lineage::has_lineage`) and the tree amounts to more than the
-    /// session's own lone node (e.g. its one fork was just discarded and
-    /// pruned). `None` hides the section entirely.
+    /// session, once it has at least one message or when it has fork/subagent
+    /// lineage to draw (`crate::lineage::has_lineage`). A message makes the
+    /// session's own timeline useful even when the tree is still a lone node.
+    /// For a message-less session, lineage must amount to more than its lone
+    /// node (e.g. a discarded and pruned fork does not count). `None` hides the
+    /// section entirely.
     pub fn lineage_section_session(&self) -> Option<String> {
         let id = self.selected_id()?;
+        if self
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .is_some_and(|session| session.message_count > 0)
+        {
+            return Some(id);
+        }
         if !crate::lineage::has_lineage(&id, &self.sessions) {
             return None;
         }
