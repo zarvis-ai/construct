@@ -7784,11 +7784,31 @@ fn render_chat(f: &mut Frame, area: Rect, app: &mut App) {
 /// The modeline's compact model segment — no `"model:"` label (unlike the
 /// harness-hover tooltip), just the bare value(s): `"-"` when nothing is
 /// known, the model alone, or `"model (effort)"` when both are known.
-fn modeline_model_text(model: Option<&str>, effort: Option<&str>) -> String {
-    match (model, effort) {
+/// The modeline's model chunk: `model (effort)` plus the context gauge
+/// (spec 0104) right after it — `(used/window pct%)` when the harness
+/// states its window, `(used)` when only usage is known (never a
+/// percentage against a guessed denominator), nothing before the first
+/// report.
+fn modeline_model_text(
+    model: Option<&str>,
+    effort: Option<&str>,
+    context_used: Option<u64>,
+    context_window: Option<u64>,
+) -> String {
+    let base = match (model, effort) {
         (Some(m), Some(e)) => format!("{m} ({e})"),
         (Some(m), None) => m.to_string(),
         (None, _) => "-".into(),
+    };
+    match (context_used, context_window) {
+        (Some(used), Some(window)) if window > 0 => format!(
+            "{base} ({}/{} {}%)",
+            crate::lineage::format_token_count(used),
+            crate::lineage::format_token_count(window),
+            used.saturating_mul(100) / window,
+        ),
+        (Some(used), _) => format!("{base} ({})", crate::lineage::format_token_count(used)),
+        (None, _) => base,
     }
 }
 
@@ -7865,7 +7885,12 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
             None => "-".into(),
         },
         model = match s {
-            Some(s) => modeline_model_text(s.model.as_deref(), s.effort.as_deref()),
+            Some(s) => modeline_model_text(
+                s.model.as_deref(),
+                s.effort.as_deref(),
+                s.context_used,
+                s.context_window,
+            ),
             None => "-".into(),
         },
     );
@@ -9025,6 +9050,7 @@ fn chat_event_kind(ev: &SessionEvent) -> ChatEventKind {
         | SessionEvent::NativeSubagentSnapshot { .. }
         | SessionEvent::NativeSubagentRemoved { .. }
         | SessionEvent::NativeSubagent { .. }
+        | SessionEvent::ContextUsage { .. }
         | SessionEvent::AgentStatus(_) => ChatEventKind::Hidden,
         SessionEvent::Message { role, text } if should_render_chat_message(*role, text) => {
             if *role == MessageRole::Assistant {
@@ -9325,6 +9351,7 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
         | SessionEvent::NativeSubagentSnapshot { .. }
         | SessionEvent::NativeSubagentRemoved { .. }
         | SessionEvent::NativeSubagent { .. }
+        | SessionEvent::ContextUsage { .. }
         | SessionEvent::AgentStatus(_) => Vec::new(),
         SessionEvent::Message { role, text } => {
             let role_label = match role {
@@ -10270,6 +10297,13 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         }
         SessionEvent::UiDelete { id } => format!("ui-delete {id}"),
         SessionEvent::Cost { usd, .. } => format!("cost ${:.4}", usd),
+        SessionEvent::ContextUsage {
+            used_tokens,
+            window_tokens,
+        } => match window_tokens {
+            Some(w) => format!("context {used_tokens}/{w}"),
+            None => format!("context {used_tokens}"),
+        },
         SessionEvent::Diff { .. } => "diff".to_string(),
         SessionEvent::Error { message } => format!("error: {}", shorten(message, 60)),
         SessionEvent::Reset => "reset".to_string(),
@@ -18459,20 +18493,47 @@ mod tests {
 
     #[test]
     fn modeline_model_text_shows_dash_when_nothing_known() {
-        assert_eq!(modeline_model_text(None, None), "-");
-        assert_eq!(modeline_model_text(None, Some("high")), "-");
+        assert_eq!(modeline_model_text(None, None, None, None), "-");
+        assert_eq!(modeline_model_text(None, Some("high"), None, None), "-");
     }
 
     #[test]
     fn modeline_model_text_shows_bare_model_without_effort() {
-        assert_eq!(modeline_model_text(Some("gpt-5.6-terra"), None), "gpt-5.6-terra");
+        assert_eq!(
+            modeline_model_text(Some("gpt-5.6-terra"), None, None, None),
+            "gpt-5.6-terra"
+        );
     }
 
     #[test]
     fn modeline_model_text_shows_model_and_effort_together() {
         assert_eq!(
-            modeline_model_text(Some("gpt-5.6-terra"), Some("high")),
+            modeline_model_text(Some("gpt-5.6-terra"), Some("high"), None, None),
             "gpt-5.6-terra (high)"
+        );
+    }
+
+    #[test]
+    fn modeline_model_text_appends_context_gauge() {
+        // Window known → used/window with an integer percent (spec 0104).
+        assert_eq!(
+            modeline_model_text(Some("gpt-5.6-terra"), Some("high"), Some(12_400), Some(258_400)),
+            "gpt-5.6-terra (high) (12k/258k 4%)"
+        );
+        // No window stated → bare usage, never a guessed percentage.
+        assert_eq!(
+            modeline_model_text(Some("kimi-for-coding"), None, Some(74_200), None),
+            "kimi-for-coding (74k)"
+        );
+        // A zero window (defensive) degrades to bare usage too.
+        assert_eq!(
+            modeline_model_text(Some("m"), None, Some(500), Some(0)),
+            "m (500)"
+        );
+        // No report yet → no gauge, even when a window somehow arrived.
+        assert_eq!(
+            modeline_model_text(Some("m"), None, None, Some(258_400)),
+            "m"
         );
     }
 
@@ -18627,6 +18688,8 @@ mod tests {
             busy_running_since_ms: None,
             message_count: 0,
             tokens: Default::default(),
+            context_used: None,
+            context_window: None,
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: construct_protocol::SessionKind::User,
             archived: false,

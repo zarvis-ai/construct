@@ -43,7 +43,7 @@ const SESSION_PLUGIN: &str = r#"export const ConstructSession = async () => {
   const usageFile = process.env.CONSTRUCT_OPENCODE_USAGE_FILE
   const forkFrom = process.env.CONSTRUCT_OPENCODE_FORK_FROM
   let rootId = null
-  const usageTotals = { input: 0, output: 0, cached: 0 }
+  const usageTotals = { input: 0, output: 0, cached: 0, context: 0 }
   const usageSeen = new Set()
   const root = async () => {
     if (!rootId && sessionFile) {
@@ -71,9 +71,11 @@ const SESSION_PLUGIN: &str = r#"export const ConstructSession = async () => {
         if (usageFile && t && info.time?.completed && info.id && !usageSeen.has(info.id)) {
           usageSeen.add(info.id)
           const cache = t.cache || {}
-          usageTotals.input += (t.input || 0) + (cache.read || 0) + (cache.write || 0)
+          const promptSide = (t.input || 0) + (cache.read || 0) + (cache.write || 0)
+          usageTotals.input += promptSide
           usageTotals.output += (t.output || 0) + (t.reasoning || 0)
           usageTotals.cached += cache.read || 0
+          usageTotals.context = promptSide
           await Bun.write(usageFile, JSON.stringify(usageTotals) + "\n")
         }
       }
@@ -359,15 +361,17 @@ fn spawn_model_watcher(path: PathBuf, requested: Option<String>, emit: EventEmit
     });
 }
 
-/// Cumulative token totals as the plugin writes them (spec 0103):
-/// `{"input":N,"output":N,"cached":N}`, where `input` already covers the
-/// full prompt side (fresh + cache reads + cache writes) and `cached` is
-/// the read subset.
+/// Token totals as the plugin writes them: cumulative `input`/`output`/
+/// `cached` (spec 0103; `input` already covers the full prompt side —
+/// fresh + cache reads + cache writes — and `cached` is the read subset),
+/// plus `context`, the LAST completed message's prompt side — the live
+/// context gauge (spec 0104), a snapshot rather than a sum.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct UsageTotals {
     input: u64,
     output: u64,
     cached: u64,
+    context: u64,
 }
 
 /// Turn the plugin's cumulative usage file into per-poll Cost deltas. The
@@ -386,8 +390,8 @@ fn spawn_usage_watcher(path: PathBuf, emit: EventEmitter) {
             let Some(observed) = read_usage(&path) else {
                 continue;
             };
-            if let Some(cost) = usage_delta_cost(&mut reported, observed) {
-                emit.emit(cost);
+            for event in usage_delta_events(&mut reported, observed) {
+                emit.emit(event);
             }
         }
     });
@@ -401,10 +405,11 @@ fn read_usage(path: &Path) -> Option<UsageTotals> {
         input: field("input"),
         output: field("output"),
         cached: field("cached"),
+        context: field("context"),
     })
 }
 
-fn usage_delta_cost(reported: &mut UsageTotals, observed: UsageTotals) -> Option<SessionEvent> {
+fn usage_delta_events(reported: &mut UsageTotals, observed: UsageTotals) -> Vec<SessionEvent> {
     if observed.input < reported.input
         || observed.output < reported.output
         || observed.cached < reported.cached
@@ -412,21 +417,33 @@ fn usage_delta_cost(reported: &mut UsageTotals, observed: UsageTotals) -> Option
         // Plugin restart: totals rebased to zero. Adopt the new baseline
         // without emitting — the drop isn't negative usage.
         *reported = observed;
-        return None;
+        return Vec::new();
     }
     let d_in = observed.input - reported.input;
     let d_out = observed.output - reported.output;
     let d_cached = observed.cached - reported.cached;
-    if d_in == 0 && d_out == 0 && d_cached == 0 {
-        return None;
+    let context_changed = observed.context != reported.context && observed.context > 0;
+    if d_in == 0 && d_out == 0 && d_cached == 0 && !context_changed {
+        return Vec::new();
     }
     *reported = observed;
-    Some(SessionEvent::Cost {
-        usd: 0.0,
-        tokens_in: d_in,
-        tokens_out: d_out,
-        tokens_cached: d_cached,
-    })
+    let mut out = Vec::new();
+    if d_in > 0 || d_out > 0 || d_cached > 0 {
+        out.push(SessionEvent::Cost {
+            usd: 0.0,
+            tokens_in: d_in,
+            tokens_out: d_out,
+            tokens_cached: d_cached,
+        });
+    }
+    if context_changed {
+        // OpenCode states no window size; bare usage only (spec 0104).
+        out.push(SessionEvent::ContextUsage {
+            used_tokens: observed.context,
+            window_tokens: None,
+        });
+    }
+    out
 }
 
 fn update_model(current: &mut Option<String>, observed: String) -> bool {
@@ -472,39 +489,47 @@ mod tests {
             input: 11_000,
             output: 120,
             cached: 2_000,
+            context: 11_000,
         };
-        match usage_delta_cost(&mut reported, first) {
-            Some(SessionEvent::Cost {
+        match usage_delta_events(&mut reported, first).as_slice() {
+            [SessionEvent::Cost {
                 tokens_in,
                 tokens_out,
                 tokens_cached,
                 ..
-            }) => {
-                assert_eq!(tokens_in, 11_000);
-                assert_eq!(tokens_out, 120);
-                assert_eq!(tokens_cached, 2_000);
+            }, SessionEvent::ContextUsage {
+                used_tokens,
+                window_tokens,
+            }] => {
+                assert_eq!(*tokens_in, 11_000);
+                assert_eq!(*tokens_out, 120);
+                assert_eq!(*tokens_cached, 2_000);
+                assert_eq!(*used_tokens, 11_000);
+                assert_eq!(*window_tokens, None);
             }
-            other => panic!("expected a Cost event: {other:?}"),
+            other => panic!("expected Cost + ContextUsage: {other:?}"),
         }
         // Unchanged totals stay quiet; growth reports only the delta.
-        assert!(usage_delta_cost(&mut reported, first).is_none());
+        assert!(usage_delta_events(&mut reported, first).is_empty());
         let second = UsageTotals {
             input: 15_000,
             output: 200,
             cached: 5_000,
+            context: 14_800,
         };
-        match usage_delta_cost(&mut reported, second) {
-            Some(SessionEvent::Cost {
+        match usage_delta_events(&mut reported, second).as_slice() {
+            [SessionEvent::Cost {
                 tokens_in,
                 tokens_out,
                 tokens_cached,
                 ..
-            }) => {
-                assert_eq!(tokens_in, 4_000);
-                assert_eq!(tokens_out, 80);
-                assert_eq!(tokens_cached, 3_000);
+            }, SessionEvent::ContextUsage { used_tokens, .. }] => {
+                assert_eq!(*tokens_in, 4_000);
+                assert_eq!(*tokens_out, 80);
+                assert_eq!(*tokens_cached, 3_000);
+                assert_eq!(*used_tokens, 14_800);
             }
-            other => panic!("expected a delta Cost event: {other:?}"),
+            other => panic!("expected delta Cost + ContextUsage: {other:?}"),
         }
         // A shrinking total = plugin restarted and rebased to zero: adopt
         // the new baseline silently, then report growth from there.
@@ -512,23 +537,26 @@ mod tests {
             input: 500,
             output: 10,
             cached: 0,
+            context: 500,
         };
-        assert!(usage_delta_cost(&mut reported, rebased).is_none());
+        assert!(usage_delta_events(&mut reported, rebased).is_empty());
         let grown = UsageTotals {
             input: 900,
             output: 25,
             cached: 100,
+            context: 900,
         };
-        match usage_delta_cost(&mut reported, grown) {
-            Some(SessionEvent::Cost {
+        match usage_delta_events(&mut reported, grown).as_slice() {
+            [SessionEvent::Cost {
                 tokens_in,
                 tokens_out,
                 tokens_cached,
                 ..
-            }) => {
-                assert_eq!(tokens_in, 400);
-                assert_eq!(tokens_out, 15);
-                assert_eq!(tokens_cached, 100);
+            }, SessionEvent::ContextUsage { used_tokens, .. }] => {
+                assert_eq!(*tokens_in, 400);
+                assert_eq!(*tokens_out, 15);
+                assert_eq!(*tokens_cached, 100);
+                assert_eq!(*used_tokens, 900);
             }
             other => panic!("expected post-rebase delta: {other:?}"),
         }

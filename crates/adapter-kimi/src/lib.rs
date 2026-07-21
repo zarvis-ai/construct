@@ -213,37 +213,51 @@ fn wire_effort_change(v: &Value, last_effort: &Option<String>) -> Option<String>
 }
 
 /// Token usage from a `context.append_loop_event`/`step.end` wire line
-/// (spec 0103). Kimi stamps one per LLM call:
+/// (spec 0103) plus the context gauge it implies (spec 0104). Kimi stamps
+/// one per LLM call:
 /// `{"usage":{"inputOther","output","inputCacheRead","inputCacheCreation"}}`.
-/// `tokens_in` covers the full prompt side (other + cache reads + cache
-/// creation), keeping `tokens_cached ⊆ tokens_in` per the Cost contract.
+/// `tokens_in` (and the gauge's `used_tokens` — the prompt side that
+/// actually filled the window on this call) covers other + cache reads +
+/// cache creation, keeping `tokens_cached ⊆ tokens_in` per the Cost
+/// contract. Kimi states no window size, so the gauge has no denominator.
 /// No dedupe needed — each step lands exactly once and the watcher's line
 /// cursor already skips history on resume.
-fn wire_usage_cost(v: &Value) -> Option<SessionEvent> {
+fn wire_usage_events(v: &Value) -> Vec<SessionEvent> {
     if v.get("type").and_then(|t| t.as_str()) != Some("context.append_loop_event") {
-        return None;
+        return Vec::new();
     }
-    let event = v.get("event")?;
+    let Some(event) = v.get("event") else {
+        return Vec::new();
+    };
     if event.get("type").and_then(|t| t.as_str()) != Some("step.end") {
-        return None;
+        return Vec::new();
     }
-    let usage = event.get("usage")?;
+    let Some(usage) = event.get("usage") else {
+        return Vec::new();
+    };
     let field = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
     let other = field("inputOther");
     let output = field("output");
     let cache_read = field("inputCacheRead");
     let cache_creation = field("inputCacheCreation");
     if other == 0 && output == 0 && cache_read == 0 && cache_creation == 0 {
-        return None;
+        return Vec::new();
     }
-    Some(SessionEvent::Cost {
-        usd: 0.0,
-        tokens_in: other
-            .saturating_add(cache_read)
-            .saturating_add(cache_creation),
-        tokens_out: output,
-        tokens_cached: cache_read,
-    })
+    let prompt_side = other
+        .saturating_add(cache_read)
+        .saturating_add(cache_creation);
+    vec![
+        SessionEvent::Cost {
+            usd: 0.0,
+            tokens_in: prompt_side,
+            tokens_out: output,
+            tokens_cached: cache_read,
+        },
+        SessionEvent::ContextUsage {
+            used_tokens: prompt_side,
+            window_tokens: None,
+        },
+    ]
 }
 
 fn append_launch_args(args: &mut Vec<String>, model: Option<&str>, native_id: Option<&str>) {
@@ -405,8 +419,8 @@ fn spawn_session_watcher(setup: WatcherSetup, emit: EventEmitter) {
                     last_effort = Some(effort.clone());
                     emit.emit(SessionEvent::EffortChanged { effort });
                 }
-                if let Some(cost) = wire_usage_cost(&v) {
-                    emit.emit(cost);
+                for event in wire_usage_events(&v) {
+                    emit.emit(event);
                 }
             }
             wire_cursor = text.lines().count();
@@ -596,25 +610,32 @@ mod tests {
                 }
             }
         });
-        match wire_usage_cost(&v) {
-            Some(SessionEvent::Cost {
+        match wire_usage_events(&v).as_slice() {
+            [SessionEvent::Cost {
                 tokens_in,
                 tokens_out,
                 tokens_cached,
                 ..
-            }) => {
-                assert_eq!(tokens_in, 1029 + 68_864 + 512);
-                assert_eq!(tokens_out, 196);
-                assert_eq!(tokens_cached, 68_864);
+            }, SessionEvent::ContextUsage {
+                used_tokens,
+                window_tokens,
+            }] => {
+                assert_eq!(*tokens_in, 1029 + 68_864 + 512);
+                assert_eq!(*tokens_out, 196);
+                assert_eq!(*tokens_cached, 68_864);
+                // Context gauge (spec 0104): same prompt side, no window —
+                // kimi never states one.
+                assert_eq!(*used_tokens, 1029 + 68_864 + 512);
+                assert_eq!(*window_tokens, None);
             }
-            other => panic!("expected a Cost event: {other:?}"),
+            other => panic!("expected Cost + ContextUsage: {other:?}"),
         }
         // Non-step lines and steps without usage contribute nothing.
         let other = serde_json::json!({
             "type": "context.append_loop_event",
             "event": { "type": "step.begin" }
         });
-        assert!(wire_usage_cost(&other).is_none());
+        assert!(wire_usage_events(&other).is_empty());
     }
 
     #[test]

@@ -473,6 +473,17 @@ pub enum SessionEvent {
         #[serde(default)]
         tokens_cached: u64,
     },
+    /// Live context-window fill (spec 0104): the prompt-side token count of
+    /// the session's most recent model call, and the model's context-window
+    /// size when the harness states it. A gauge, not a counter — each report
+    /// replaces the previous one, and a context reset clears it.
+    ContextUsage {
+        used_tokens: u64,
+        /// `None` when the harness doesn't report its window; clients then
+        /// show the bare usage rather than a percentage against a guess.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_tokens: Option<u64>,
+    },
     Diff {
         patch: String,
     },
@@ -2074,6 +2085,15 @@ pub struct SessionSummary {
     /// harnesses that never report usage.
     #[serde(default, skip_serializing_if = "TokenTally::is_zero")]
     pub tokens: TokenTally,
+    /// Latest context-window fill report (spec 0104): prompt-side tokens of
+    /// the most recent model call. `None` until a harness reports (and after
+    /// a context reset). Restored from the transcript's last report at load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_used: Option<u64>,
+    /// The model's context-window size, when the harness states it alongside
+    /// its usage reports. `None` = unknown; clients show bare usage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// How adapters that gate tools handle Risky tool calls.
     #[serde(default)]
     pub approval_mode: ApprovalMode,

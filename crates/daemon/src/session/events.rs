@@ -57,6 +57,8 @@ impl SessionManager {
                 s.event_count = 0;
                 s.message_count = 0;
                 s.tokens = Default::default();
+                s.context_used = None;
+                s.context_window = None;
                 s.last_pty_at_ms = None;
                 crate::session::set_state_tracked(
                     &mut s,
@@ -414,6 +416,18 @@ impl SessionManager {
                     s.cost_usd = Some(s.cost_usd.unwrap_or(0.0) + *usd);
                     s.tokens.add(*tokens_in, *tokens_out, *tokens_cached);
                 }
+                SessionEvent::ContextUsage {
+                    used_tokens,
+                    window_tokens,
+                } => {
+                    // A gauge, not a counter (spec 0104): latest report wins.
+                    // The window sticks once known — a harness that omits it
+                    // on some reports doesn't blank an established gauge.
+                    s.context_used = Some(*used_tokens);
+                    if window_tokens.is_some() {
+                        s.context_window = *window_tokens;
+                    }
+                }
                 SessionEvent::Done { exit_code } => {
                     let terminal = if *exit_code == 0 {
                         SessionState::Done
@@ -636,6 +650,8 @@ impl SessionManager {
                     .then_some(now.timestamp_millis()),
                 message_count: 0,
                 tokens: Default::default(),
+                context_used: None,
+                context_window: None,
                 approval_mode: owner_summary.approval_mode,
                 kind: construct_protocol::SessionKind::Subagent,
                 archived: false,

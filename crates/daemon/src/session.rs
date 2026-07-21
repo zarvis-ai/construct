@@ -1486,15 +1486,18 @@ impl SessionManager {
             // Recover seq counter from transcript line count, and recount
             // chat messages and token tallies while we're at it —
             // `message_count`/`tokens` then self-heal for summaries saved
-            // before the fields existed (or that lagged a crash).
+            // before the fields existed (or that lagged a crash). The
+            // context gauge (spec 0104) restores from the LAST report seen,
+            // and a Reset along the way clears it — mirroring the live fold.
             let path = storage.transcript_path(&s.id);
-            let (count, message_count, tokens) = if path.exists() {
+            let (count, message_count, tokens, context) = if path.exists() {
                 let f = std::fs::File::open(&path)?;
                 let reader = std::io::BufReader::new(f);
                 use std::io::BufRead;
                 let mut n = 0u64;
                 let mut msgs = 0u64;
                 let mut tally = construct_protocol::TokenTally::default();
+                let mut context: (Option<u64>, Option<u64>) = (None, None);
                 for line in reader.lines() {
                     let line = line?;
                     if line.trim().is_empty() {
@@ -1512,17 +1515,29 @@ impl SessionManager {
                                 tokens_cached,
                                 ..
                             } => tally.add(tokens_in, tokens_out, tokens_cached),
+                            SessionEvent::ContextUsage {
+                                used_tokens,
+                                window_tokens,
+                            } => {
+                                context.0 = Some(used_tokens);
+                                if window_tokens.is_some() {
+                                    context.1 = window_tokens;
+                                }
+                            }
+                            SessionEvent::Reset => context = (None, None),
                             _ => {}
                         }
                     }
                 }
-                (n, msgs, tally)
+                (n, msgs, tally, context)
             } else {
-                (0, 0, construct_protocol::TokenTally::default())
+                (0, 0, construct_protocol::TokenTally::default(), (None, None))
             };
             let mut s = s;
             s.message_count = message_count;
             s.tokens = tokens;
+            s.context_used = context.0;
+            s.context_window = context.1;
             // Scrollback survives daemon restarts because `pty_replay`
             // serves it from the on-disk `pty.log` directly; no in-memory
             // rehydration needed.
@@ -4615,6 +4630,10 @@ impl SessionManager {
             busy_running_since_ms: None,
             message_count,
             tokens,
+            // The snapshot is the frozen pre-reset conversation; its gauge is
+            // recovered from the copied transcript at next load anyway.
+            context_used: None,
+            context_window: None,
             approval_mode,
             kind: construct_protocol::SessionKind::User,
             archived: true,
@@ -5269,6 +5288,8 @@ mod tests {
             busy_running_since_ms: None,
             message_count: 0,
             tokens: Default::default(),
+            context_used: None,
+            context_window: None,
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
@@ -5762,6 +5783,8 @@ mod tests {
                 busy_running_since_ms: None,
                 message_count: 0,
                 tokens: Default::default(),
+                context_used: None,
+                context_window: None,
                 approval_mode: construct_protocol::ApprovalMode::Manual,
                 kind,
                 archived: false,
@@ -7679,6 +7702,8 @@ mod tests {
             busy_running_since_ms: None,
             message_count: 0,
             tokens: Default::default(),
+            context_used: None,
+            context_window: None,
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: construct_protocol::SessionKind::User,
             forked_from: None,
@@ -7823,6 +7848,8 @@ mod tests {
             busy_running_since_ms: None,
             message_count: 0,
             tokens: Default::default(),
+            context_used: None,
+            context_window: None,
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: construct_protocol::SessionKind::User,
             archived: false,

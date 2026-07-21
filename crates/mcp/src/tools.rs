@@ -2232,6 +2232,8 @@ mod tests {
             busy_running_since_ms: None,
             message_count: 0,
             tokens: construct_protocol::TokenTally::default(),
+            context_used: None,
+            context_window: None,
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: SessionKind::Subagent,
             archived: false,

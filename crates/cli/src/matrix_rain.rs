@@ -568,6 +568,7 @@ fn word_for_event(event: &SessionEvent) -> Option<(&'static str, FlashTone, u8)>
         SessionEvent::Message { .. }
         | SessionEvent::ToolResult { .. }
         | SessionEvent::Cost { .. }
+        | SessionEvent::ContextUsage { .. }
         | SessionEvent::Diff { .. }
         | SessionEvent::Pty { .. }
         | SessionEvent::PtyResize { .. }

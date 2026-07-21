@@ -295,6 +295,26 @@ fn grok_updates_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
     Some(grok_session_dir(cwd, session_id)?.join("updates.jsonl"))
 }
 
+/// Context gauge from a session dir's `signals.json` (spec 0104): grok
+/// maintains `contextTokensUsed` / `contextWindowTokens` there — the only
+/// per-session token figures its files expose (its chat/updates streams
+/// carry no billing usage split). Returns `(used, window)` when the file
+/// parses and reports non-zero usage.
+fn grok_context_usage(cwd: &Path, session_id: &str) -> Option<(u64, Option<u64>)> {
+    let path = grok_session_dir(cwd, session_id)?.join("signals.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let used = v.get("contextTokensUsed").and_then(Value::as_u64)?;
+    if used == 0 {
+        return None;
+    }
+    let window = v
+        .get("contextWindowTokens")
+        .and_then(Value::as_u64)
+        .filter(|w| *w > 0);
+    Some((used, window))
+}
+
 fn count_jsonl_lines(path: &Path) -> usize {
     std::fs::read_to_string(path)
         .map(|s| s.lines().count())
@@ -694,6 +714,9 @@ fn spawn_interactive_transcript_watcher(
         // window far faster than that window can recur in practice.
         let mut ticks_since_sibling_refresh: u32 = 0;
         let mut sibling_ids: HashSet<String> = sibling_native_ids(&cwd);
+        // Last context gauge reported (spec 0104) — poll `signals.json`
+        // each tick but only emit when the numbers actually move.
+        let mut last_context: Option<(u64, Option<u64>)> = None;
         loop {
             tick.tick().await;
             ticks_since_sibling_refresh += 1;
@@ -716,6 +739,18 @@ fn spawn_interactive_transcript_watcher(
                 for value in read_new_grok_jsonl_lines(updates_path, &mut next_update_line, &emit) {
                     if let Some(update) = grok_native_subagent_update(&value, root_id) {
                         apply_grok_native_update(update, &mut children, Some(&emit));
+                    }
+                }
+            }
+            if let Some(root_id) = current_id.as_deref() {
+                let observed = grok_context_usage(&cwd, root_id);
+                if let Some((used, window)) = observed {
+                    if last_context != Some((used, window)) {
+                        last_context = Some((used, window));
+                        emit.emit(SessionEvent::ContextUsage {
+                            used_tokens: used,
+                            window_tokens: window,
+                        });
                     }
                 }
             }
@@ -771,6 +806,7 @@ fn spawn_interactive_transcript_watcher(
                         updates_path = Some(new_updates_path);
                         next_line = 0;
                         next_update_line = 0;
+                        last_context = None;
                     }
                 }
             }

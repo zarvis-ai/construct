@@ -222,7 +222,7 @@ both existed for months before we consumed them).
 | ModelChanged | ✓ | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | n/a |
 | EffortChanged | ✓ | — | ✓ | — | ✓ | ✓ | ✓ | n/a |
 | Token split (0103) | ✓ | ✓ | ✓ | ✓ | ✓ | gap² | none³ | n/a |
-| Context gauge (0104) | planned | in flight | in flight | in flight | in flight | planned² | none³ | n/a |
+| Context gauge (0104) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | none³ | n/a |
 | USD cost | ✓ | headless only | — | gap⁴ | — | — | — | n/a |
 | Native resume | ✓ (own state) | ✓ | ✓ | ✓ | ✓ | ✓ | — | fresh shell |
 | Reset detection (0085) | n/a | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | n/a |
@@ -235,9 +235,10 @@ both existed for months before we consumed them).
 ¹ grok reports the model, but its upstream `model_id` was observed frozen
 per session — a mid-session switch may go unreported (investigation note in
 adapter-codex's `codex_model_change` doc).
-² grok's session files expose `contextTokensUsed`/`contextWindowTokens`
-(exact context gauge) and a cumulative unsplit `totalTokens` — real data,
-not yet consumed.
+² grok's `contextTokensUsed`/`contextWindowTokens` now feed the context
+gauge (spec 0104), but its only per-session consumption figure is a
+cumulative unsplit `totalTokens` — real data a token-split delta could
+consume, still unwired.
 ³ antigravity exposes no token/cost data in print mode or its logs
 (checked; documented in the adapter).
 ⁴ opencode stores exact per-message USD `cost` in the same event the plugin

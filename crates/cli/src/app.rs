@@ -810,6 +810,7 @@ fn chat_scroll_kind(ev: &SessionEvent) -> ChatScrollKind {
         | SessionEvent::NativeSubagentSnapshot { .. }
         | SessionEvent::NativeSubagentRemoved { .. }
         | SessionEvent::NativeSubagent { .. }
+        | SessionEvent::ContextUsage { .. }
         | SessionEvent::AgentStatus(_) => ChatScrollKind::Hidden,
         SessionEvent::Message { role, text }
             if should_render_chat_message_for_scroll(*role, text) =>
@@ -13972,6 +13973,8 @@ mod tests {
             busy_running_since_ms: None,
             message_count: 0,
             tokens: Default::default(),
+            context_used: None,
+            context_window: None,
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind,
             archived: false,

@@ -99,6 +99,8 @@ impl SessionManager {
             busy_running_since_ms: None,
             message_count: 0,
             tokens: Default::default(),
+            context_used: None,
+            context_window: None,
             merge: None,
         };
         self.storage.save_summary(&summary)?;

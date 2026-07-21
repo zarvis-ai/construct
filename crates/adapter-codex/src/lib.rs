@@ -557,8 +557,8 @@ fn emit_codex_rollout_event(
         *last_effort = Some(effort.clone());
         emit.emit(SessionEvent::EffortChanged { effort });
     }
-    if let Some(cost) = codex_usage_cost(v, reported_usage) {
-        emit.emit(cost);
+    for event in codex_usage_events(v, reported_usage) {
+        emit.emit(event);
     }
     for event in codex_rollout_events(v) {
         emit.emit(event);
@@ -581,30 +581,54 @@ struct UsageTotals {
 /// makes duplicates harmless. This supersedes the headless footer parse
 /// for interactive sessions — the footer only exists in `codex exec`
 /// output, which has no rollout watcher, so the two never overlap.
-fn codex_usage_cost(v: &Value, reported: &mut UsageTotals) -> Option<SessionEvent> {
+///
+/// A fresh delta also refreshes the context gauge (spec 0104): the same
+/// record's `last_token_usage.input_tokens` is the prompt side of the most
+/// recent call — exactly what filled the window — and codex states the
+/// window itself in `model_context_window`. Gated on the delta so repeated
+/// identical snapshots don't respam an unchanged gauge.
+fn codex_usage_events(v: &Value, reported: &mut UsageTotals) -> Vec<SessionEvent> {
     if v.get("type").and_then(Value::as_str) != Some("event_msg") {
-        return None;
+        return Vec::new();
     }
-    let payload = v.get("payload")?;
+    let Some(payload) = v.get("payload") else {
+        return Vec::new();
+    };
     if payload.get("type").and_then(Value::as_str) != Some("token_count") {
-        return None;
+        return Vec::new();
     }
-    let total = rollout_usage_totals(payload)?;
+    let Some(total) = rollout_usage_totals(payload) else {
+        return Vec::new();
+    };
     let d_in = total.input.saturating_sub(reported.input);
     let d_out = total.output.saturating_sub(reported.output);
     let d_cached = total.cached.saturating_sub(reported.cached);
     if d_in == 0 && d_out == 0 && d_cached == 0 {
-        return None;
+        return Vec::new();
     }
     reported.input = reported.input.max(total.input);
     reported.output = reported.output.max(total.output);
     reported.cached = reported.cached.max(total.cached);
-    Some(SessionEvent::Cost {
+    let mut out = vec![SessionEvent::Cost {
         usd: 0.0,
         tokens_in: d_in,
         tokens_out: d_out,
         tokens_cached: d_cached,
-    })
+    }];
+    let last_input = payload
+        .pointer("/info/last_token_usage/input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if last_input > 0 {
+        out.push(SessionEvent::ContextUsage {
+            used_tokens: last_input,
+            window_tokens: payload
+                .pointer("/info/model_context_window")
+                .and_then(Value::as_u64)
+                .filter(|w| *w > 0),
+        });
+    }
+    out
 }
 
 /// The cumulative `total_token_usage` from a `token_count` payload.
@@ -1201,12 +1225,14 @@ mod tests {
     }
 
     #[test]
-    fn token_count_records_emit_delta_costs() {
+    fn token_count_records_emit_delta_costs_and_context_gauge() {
         // Real rollout shape: cumulative `total_token_usage` where `input_
-        // tokens` already includes the cached reads. Two snapshots →
-        // first emits its full totals, second emits only the delta, and a
-        // repeated (unchanged) snapshot emits nothing.
-        let snapshot = |input: u64, cached: u64, output: u64| {
+        // tokens` already includes the cached reads, plus the most recent
+        // call's own usage and the model window. Two snapshots → first
+        // emits its full totals, second emits only the delta, a repeated
+        // (unchanged) snapshot emits nothing — and each fresh delta rides
+        // with a ContextUsage gauge from `last_token_usage` (spec 0104).
+        let snapshot = |input: u64, cached: u64, output: u64, last_input: u64| {
             serde_json::json!({
                 "type": "event_msg",
                 "payload": {
@@ -1219,41 +1245,48 @@ mod tests {
                             "reasoning_output_tokens": 3,
                             "total_tokens": input + output
                         },
-                        "last_token_usage": {}
+                        "last_token_usage": { "input_tokens": last_input },
+                        "model_context_window": 258_400
                     }
                 }
             })
         };
         let mut reported = UsageTotals::default();
-        match codex_usage_cost(&snapshot(19_094, 9_984, 184), &mut reported) {
-            Some(SessionEvent::Cost {
+        match codex_usage_events(&snapshot(19_094, 9_984, 184, 19_094), &mut reported).as_slice() {
+            [SessionEvent::Cost {
                 tokens_in,
                 tokens_out,
                 tokens_cached,
                 ..
-            }) => {
-                assert_eq!(tokens_in, 19_094);
-                assert_eq!(tokens_out, 184);
-                assert_eq!(tokens_cached, 9_984);
+            }, SessionEvent::ContextUsage {
+                used_tokens,
+                window_tokens,
+            }] => {
+                assert_eq!(*tokens_in, 19_094);
+                assert_eq!(*tokens_out, 184);
+                assert_eq!(*tokens_cached, 9_984);
+                assert_eq!(*used_tokens, 19_094);
+                assert_eq!(*window_tokens, Some(258_400));
             }
-            other => panic!("expected a Cost event: {other:?}"),
+            other => panic!("expected Cost + ContextUsage: {other:?}"),
         }
-        match codex_usage_cost(&snapshot(48_890, 19_968, 257), &mut reported) {
-            Some(SessionEvent::Cost {
+        match codex_usage_events(&snapshot(48_890, 19_968, 257, 29_796), &mut reported).as_slice() {
+            [SessionEvent::Cost {
                 tokens_in,
                 tokens_out,
                 tokens_cached,
                 ..
-            }) => {
-                assert_eq!(tokens_in, 29_796);
-                assert_eq!(tokens_out, 73);
-                assert_eq!(tokens_cached, 9_984);
+            }, SessionEvent::ContextUsage { used_tokens, .. }] => {
+                assert_eq!(*tokens_in, 29_796);
+                assert_eq!(*tokens_out, 73);
+                assert_eq!(*tokens_cached, 9_984);
+                assert_eq!(*used_tokens, 29_796);
             }
-            other => panic!("expected a delta Cost event: {other:?}"),
+            other => panic!("expected delta Cost + ContextUsage: {other:?}"),
         }
         assert!(
-            codex_usage_cost(&snapshot(48_890, 19_968, 257), &mut reported).is_none(),
-            "an unchanged snapshot must not re-report usage"
+            codex_usage_events(&snapshot(48_890, 19_968, 257, 29_796), &mut reported).is_empty(),
+            "an unchanged snapshot must not re-report usage or respam the gauge"
         );
     }
 

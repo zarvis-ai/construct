@@ -2994,6 +2994,15 @@ pub async fn run(
                 tokens_out: turn.usage.output_tokens,
                 tokens_cached: turn.usage.cached_tokens,
             });
+            // Context gauge (spec 0104): this call's prompt side against the
+            // limit smith itself budgets requests with (learned, else the
+            // hardcoded per-model window).
+            if turn.usage.input_tokens > 0 {
+                emit.emit(SessionEvent::ContextUsage {
+                    used_tokens: turn.usage.input_tokens,
+                    window_tokens: Some(effective_cap),
+                });
+            }
 
             if turn.is_empty() {
                 final_status = "Errored";

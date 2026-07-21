@@ -970,9 +970,7 @@ fn claude_events_from_json(v: &Value, last_usage_msg_id: &mut Option<String>) ->
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "assistant" => {
             let mut out = Vec::new();
-            if let Some(cost) = claude_cost_from_assistant(v, last_usage_msg_id) {
-                out.push(cost);
-            }
+            out.extend(claude_usage_from_assistant(v, last_usage_msg_id));
             let text = extract_message_text(v.get("message"));
             if !text.is_empty() {
                 out.push(SessionEvent::Message {
@@ -1013,19 +1011,29 @@ fn claude_events_from_json(v: &Value, last_usage_msg_id: &mut Option<String>) ->
     }
 }
 
-/// Token usage from an assistant record's `message.usage` (spec 0103).
-/// Both the native session transcript and `-p` stream-json carry it. One
-/// API message can span several transcript records (one per content
-/// block), each repeating the same `message.id` and usage — dedupe on the
-/// id so a message's usage is reported exactly once. `tokens_in` is the
-/// full prompt side (fresh input + cache creation + cache reads), keeping
-/// `tokens_cached ⊆ tokens_in` per the `Cost` event's contract.
-fn claude_cost_from_assistant(v: &Value, last_usage_msg_id: &mut Option<String>) -> Option<SessionEvent> {
-    let msg = v.get("message")?;
-    let usage = msg.get("usage")?;
-    let id = msg.get("id").and_then(|i| i.as_str())?;
+/// Token usage from an assistant record's `message.usage` (spec 0103) plus
+/// the context gauge it implies (spec 0104). Both the native session
+/// transcript and `-p` stream-json carry the usage. One API message can
+/// span several transcript records (one per content block), each repeating
+/// the same `message.id` and usage — dedupe on the id so a message's usage
+/// is reported exactly once. `tokens_in` (and the gauge's `used_tokens`,
+/// which is the same prompt-side sum — what actually filled the window on
+/// this call) covers fresh input + cache creation + cache reads, keeping
+/// `tokens_cached ⊆ tokens_in` per the `Cost` event's contract. Claude
+/// states no context-window size, so the gauge carries no denominator.
+fn claude_usage_from_assistant(
+    v: &Value,
+    last_usage_msg_id: &mut Option<String>,
+) -> Vec<SessionEvent> {
+    let Some(msg) = v.get("message") else {
+        return Vec::new();
+    };
+    let (Some(usage), Some(id)) = (msg.get("usage"), msg.get("id").and_then(|i| i.as_str()))
+    else {
+        return Vec::new();
+    };
     if last_usage_msg_id.as_deref() == Some(id) {
-        return None;
+        return Vec::new();
     }
     let field = |k: &str| usage.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
     let input = field("input_tokens");
@@ -1033,17 +1041,24 @@ fn claude_cost_from_assistant(v: &Value, last_usage_msg_id: &mut Option<String>)
     let cache_read = field("cache_read_input_tokens");
     let cache_creation = field("cache_creation_input_tokens");
     if input == 0 && output == 0 && cache_read == 0 && cache_creation == 0 {
-        return None;
+        return Vec::new();
     }
     *last_usage_msg_id = Some(id.to_string());
-    Some(SessionEvent::Cost {
-        usd: 0.0,
-        tokens_in: input
-            .saturating_add(cache_read)
-            .saturating_add(cache_creation),
-        tokens_out: output,
-        tokens_cached: cache_read,
-    })
+    let prompt_side = input
+        .saturating_add(cache_read)
+        .saturating_add(cache_creation);
+    vec![
+        SessionEvent::Cost {
+            usd: 0.0,
+            tokens_in: prompt_side,
+            tokens_out: output,
+            tokens_cached: cache_read,
+        },
+        SessionEvent::ContextUsage {
+            used_tokens: prompt_side,
+            window_tokens: None,
+        },
+    ]
 }
 
 fn extract_message_text(msg: Option<&Value>) -> String {
@@ -1472,6 +1487,18 @@ mod tests {
             }
             other => panic!("expected a leading Cost event, got {other:?}"),
         }
+        // The Cost rides with the context gauge (spec 0104): same prompt
+        // side, no window (claude never states one).
+        match first.get(1) {
+            Some(SessionEvent::ContextUsage {
+                used_tokens,
+                window_tokens,
+            }) => {
+                assert_eq!(*used_tokens, 137);
+                assert_eq!(*window_tokens, None);
+            }
+            other => panic!("expected a ContextUsage event after Cost, got {other:?}"),
+        }
         let second = claude_events_from_json(
             &record(serde_json::json!({
                 "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}
@@ -1479,9 +1506,10 @@ mod tests {
             &mut last_id,
         );
         assert!(
-            !second
-                .iter()
-                .any(|e| matches!(e, SessionEvent::Cost { .. })),
+            !second.iter().any(|e| matches!(
+                e,
+                SessionEvent::Cost { .. } | SessionEvent::ContextUsage { .. }
+            )),
             "same message id must not report usage twice: {second:?}"
         );
 
