@@ -13542,6 +13542,7 @@ fn render_program_selection_context_menu(
         PROGRAM_SELECTION_RUN_BUTTON
     };
     let run_button_width = UnicodeWidthStr::width(PROGRAM_SELECTION_RUN_MAIN_BUTTON);
+    let rendered_run_button_width = UnicodeWidthStr::width(run_button);
     let button_x = inner_x.saturating_add(inner_width.saturating_sub(run_button_width) as u16);
     let hit = (
         button_x,
@@ -13631,7 +13632,11 @@ fn render_program_selection_context_menu(
             let text_width = UnicodeWidthStr::width(truncated.as_str());
             let pad = comment_width
                 .saturating_sub(text_width)
-                .saturating_add(comment_gap);
+                .saturating_add(comment_gap)
+                // Reserve the longer Shift-preview label when sizing the
+                // comment, but keep the shorter default label pinned to the
+                // same right edge instead of leaving unused space after it.
+                .saturating_add(run_button_width.saturating_sub(rendered_run_button_width));
             let mut spans = vec![
                 Span::styled(truncated, comment_style),
                 Span::raw(" ".repeat(pad)),
