@@ -31,8 +31,9 @@ pub enum Step1Phase {
     /// Exercise A, part 1: waiting for a bare `Ctrl+X` press so the modeline
     /// echoes the pending chord.
     AwaitCtrlX,
-    /// Exercise A, part 2: `C-x` is pending; waiting for `Ctrl+G` to cancel it.
-    AwaitCtrlG,
+    /// Exercise A, part 2: `C-x` is pending; waiting for `C-g` or `Esc` to
+    /// cancel it.
+    AwaitCancel,
     /// Exercise B: waiting for the real "create session" chord, which both
     /// opens the picker and completes step 1.
     AwaitNewSession,
@@ -440,13 +441,13 @@ fn step1_lines(phase: Step1Phase, profile: Profile) -> Vec<TutorialLine> {
                 t(" now."),
             ]);
         }
-        Step1Phase::AwaitCtrlG => {
+        Step1Phase::AwaitCancel => {
             lines.push(vec![
-                t("Pending! Now press "),
-                k("Ctrl+G", KeyAction::TutorialNudge),
+                t("Now press "),
+                k("Ctrl+G (or Esc)", KeyAction::TutorialNudge),
                 t(" to cancel it."),
             ]);
-            lines.push(vec![t("C-g backs out of anything half-typed:")]);
+            lines.push(vec![t("C-g or Esc backs out of anything half-typed:")]);
             lines.push(vec![t("chords, prompts, pickers.")]);
         }
         Step1Phase::AwaitNewSession => {
@@ -693,7 +694,7 @@ fn step8_lines(profile: Profile, list_focused: bool) -> Vec<TutorialLine> {
         "{} quits — don't press it now!",
         chord_label(KeyAction::Quit, profile)
     ))]);
-    lines.push(vec![t("(C-g still backs out, as in step 1.)")]);
+    lines.push(vec![t("(C-g or Esc still backs out, as in step 1.)")]);
     lines.push(vec![]);
     lines.push(vec![k("[got it]", KeyAction::TutorialNextStep)]);
     lines
@@ -875,7 +876,7 @@ impl App {
                     ) {
                         let label = chord_label(KeyAction::OpenNewSession, t.profile);
                         t.feedback = Some(format!(
-                            "that ran something else — press C-g and try {label} again"
+                            "that ran something else — press C-g (or Esc) and try {label} again"
                         ));
                     }
                 }
@@ -943,8 +944,8 @@ impl App {
 
     /// Hook: wrong-key / pending-chord feedback for step 1, which — unlike
     /// every other step — is gated on literal keystrokes rather than a
-    /// resolved `KeyAction` (`C-x` alone, and `C-g`, are not bound to any
-    /// action). Called from the single top-level chord dispatch site in
+    /// resolved `KeyAction` (`C-x`, `C-g`, and `Esc` alone are not bound to
+    /// actions). Called from the single top-level chord dispatch site in
     /// `on_key` whenever the keymap resolves a `KeymapResult` there.
     pub fn tutorial_observe_key_result(&mut self, res: &KeymapResult, key: KeyEvent) {
         let Some(t) = self.tutorial.as_mut() else {
@@ -957,11 +958,12 @@ impl App {
             matches!(key.code, KeyCode::Char('x')) && key.modifiers == KeyModifiers::CONTROL;
         let is_ctrl_g =
             matches!(key.code, KeyCode::Char('g')) && key.modifiers == KeyModifiers::CONTROL;
+        let is_escape = matches!(key.code, KeyCode::Esc) && key.modifiers.is_empty();
         match t.step1_phase {
             Step1Phase::AwaitCtrlX => {
                 if is_ctrl_x && matches!(res, KeymapResult::Pending(_)) {
-                    t.feedback = Some("pending: C-x — now press Ctrl+G to cancel it".into());
-                    t.step1_phase = Step1Phase::AwaitCtrlG;
+                    t.feedback = Some("pending: C-x — now press C-g (or Esc) to cancel it".into());
+                    t.step1_phase = Step1Phase::AwaitCancel;
                     t.touch_progress();
                 } else if matches!(res, KeymapResult::Unhandled) {
                     t.feedback = Some(format!(
@@ -970,14 +972,15 @@ impl App {
                     ));
                 }
             }
-            Step1Phase::AwaitCtrlG => {
-                if is_ctrl_g {
-                    t.feedback = Some("cancelled — C-g backs out of anything half-typed.".into());
+            Step1Phase::AwaitCancel => {
+                if is_ctrl_g || is_escape {
+                    t.feedback =
+                        Some("cancelled — C-g or Esc backs out of anything half-typed.".into());
                     t.step1_phase = Step1Phase::AwaitNewSession;
                     t.touch_progress();
                 } else if matches!(res, KeymapResult::Unhandled) {
                     t.feedback = Some(format!(
-                        "you pressed {} — the key to reach for is C-g",
+                        "you pressed {} — use C-g or Esc",
                         crate::keymap::format_key(&key)
                     ));
                 }
@@ -1684,7 +1687,7 @@ mod tests {
                 for step in 1..=STEP_COUNT {
                     for phase in [
                         Step1Phase::AwaitCtrlX,
-                        Step1Phase::AwaitCtrlG,
+                        Step1Phase::AwaitCancel,
                         Step1Phase::AwaitNewSession,
                     ] {
                         for sub_seen in [false, true] {

@@ -48,8 +48,8 @@ agent edits merge automatically (see [Collaboration](#collaboration)).
 | `C-y` / `C-v` | Paste |
 | `C-k` | Kill line |
 | `Tab` / `Shift-Tab` | Nest / un-nest the current list item |
-| `C-s` / `C-r` | Incremental search forward / backward (`Enter` accepts, `C-g` cancels) |
-| `C-g` | Cancel selection or search |
+| `C-s` / `C-r` | Incremental search forward / backward (`Enter` accepts, `C-g` or `Esc` cancels) |
+| `C-g` / `Esc` | Cancel selection, search, or a transient picker |
 | `@` | Open the smart-clip picker |
 
 The web client uses native browser editing (caret, selection, clipboard, undo,

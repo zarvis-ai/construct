@@ -18,14 +18,15 @@ key label in the card dispatches the exact same action a keypress would.
 
 The exception is the tour's first step, which teaches the emacs-style
 two-key chord notation itself (e.g. "C-x C-f means hold Ctrl, tap X, then
-still holding Ctrl, tap F") and the universal `C-g` escape hatch. That step
+still holding Ctrl, tap F") and the universal `C-g` escape hatch, with `Esc`
+shown alongside it as the browser-safe alternative. That step
 requires real keystrokes — it is teaching fingers, not testing recognition —
 so its key labels are click-only nudges rather than click-advance. Every
 other step is fully clickable: a mouse-only user can complete the whole tour
 without ever pressing a chord.
 
 The tour covers, in order: how to read chord notation and back out with
-`C-g`; creating a practice session; sending it a message; finding the session
+`C-g` or `Esc`; creating a practice session; sending it a message; finding the session
 title-bar menu to fork a parallel conversation and then merge or discard its
 result; moving focus and selection around the list/view; opening the program board, applying the
 built-in "Tasks" template, and running it so the board's own rule delegates

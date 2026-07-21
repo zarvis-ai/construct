@@ -661,12 +661,17 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Esc if self.program_smart_clip_active() => self.cancel_program_smart_clip(),
-            // Esc only cancels the transient smart-clip picker (above); it is
-            // intentionally NOT a program-hide affordance. Show/hide is C-x
-            // Space (and the title-glyph toggle) only, so a reflexive Esc
-            // while editing program prose doesn't blow away the surface.
-            KeyCode::Esc => {}
+            KeyCode::Esc => {
+                // Esc is Construct's browser-safe universal cancel key. It
+                // dismisses transient Program UI and clears an active mark,
+                // but deliberately never hides or mutates the Program itself.
+                self.cancel_program_smart_clip();
+                if let Some(popup) = self.program_popup.as_mut() {
+                    popup.selection = None;
+                    popup.selection_menu = None;
+                }
+                self.set_status("program selection canceled".to_string());
+            }
             KeyCode::Enter if self.program_smart_clip_active() => self.accept_program_smart_clip(),
             KeyCode::Tab if self.program_smart_clip_active() && !ctrl && !alt => {
                 self.accept_program_smart_clip()
@@ -682,10 +687,7 @@ impl App {
             KeyCode::Left if self.program_smart_clip_active() => self.program_smart_clip_collapse(),
             _ if matches!(ctrl_char, Some(' ' | '@' | '\0')) => self.begin_program_selection(),
             _ if ctrl_char == Some('g') => {
-                // C-g cancels: dismiss the transient smart-clip picker and
-                // clear any active C-Space selection mark. No-op when neither
-                // is active. Like Esc, it is deliberately NOT a program-hide
-                // affordance — it never closes or mutates the surface.
+                // Keep the traditional Emacs C-g as an alias for Esc.
                 self.cancel_program_smart_clip();
                 if let Some(popup) = self.program_popup.as_mut() {
                     popup.selection = None;

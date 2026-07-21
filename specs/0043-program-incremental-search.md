@@ -10,7 +10,8 @@ Scope: Incremental search behavior in markdown program editing.
 Program markdown editing uses Emacs-style incremental search with `C-s` to enter search mode, incremental query input, and explicit navigation with `C-s` (next) / `C-r` (previous). Exiting search is split by intent:
 
 - `Enter` accepts the current match and closes search mode.
-- `C-g` cancels search mode and restores the cursor to the pre-search anchor.
+- `C-g` or `Esc` cancels search mode and restores the cursor to the pre-search
+  anchor. Both keys have identical cancel semantics.
 
 While search is active, every typed character extends the query and updates match ranges. Pasted text is also consumed by the search prompt as query text rather than inserted into the program document. Search highlights are visible in the program body and the active match is visually distinguished from non-active matches.
 
@@ -35,5 +36,5 @@ This spec does not define full regex search, case-sensitivity toggles, search/re
 ## Examples
 
 - `C-s` `a` `l` `p` `h` `a` `C-s` cycles from the first match to the next; `C-r` cycles backward.
-- `C-s` then `C-g` returns to the query start position and closes the I-search bar state.
+- `C-s` then `C-g` (or `Esc`) returns to the query start position and closes the I-search bar state.
 - `C-s` with an empty query opens I-search with no active match, then typing begins collecting matches immediately.
