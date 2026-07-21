@@ -146,6 +146,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.shortcut_hints.clear();
     app.layout.tutorial_card_area = None;
     app.layout.modeline_approval_mode_hit = None;
+    app.layout.modeline_context_gauge_hit = None;
     app.layout.modeline_theme_hit = None;
     app.layout.main_window_areas.clear();
     app.layout.main_window_dividers.clear();
@@ -321,6 +322,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_harness_unavailable_tooltip(f, app);
     render_harness_hover_tooltip(f, app);
     render_modeline_approval_mode_tooltip(f, app);
+    render_modeline_context_gauge_tooltip(f, app);
     render_modeline_version_notice_tooltip(f, app);
     render_modeline_remote_tooltip(f, app);
     render_modeline_theme_tooltip(f, app);
@@ -7784,32 +7786,38 @@ fn render_chat(f: &mut Frame, area: Rect, app: &mut App) {
 /// The modeline's compact model segment — no `"model:"` label (unlike the
 /// harness-hover tooltip), just the bare value(s): `"-"` when nothing is
 /// known, the model alone, or `"model (effort)"` when both are known.
-/// The modeline's model chunk: `model (effort)` plus the context gauge
-/// (spec 0104) right after it — `(used/window pct%)` when the harness
-/// states its window, `(used)` when only usage is known (never a
-/// percentage against a guessed denominator), nothing before the first
-/// report.
-fn modeline_model_text(
-    model: Option<&str>,
-    effort: Option<&str>,
-    context_used: Option<u64>,
-    context_window: Option<u64>,
-) -> String {
-    let base = match (model, effort) {
+fn modeline_model_text(model: Option<&str>, effort: Option<&str>) -> String {
+    match (model, effort) {
         (Some(m), Some(e)) => format!("{m} ({e})"),
         (Some(m), None) => m.to_string(),
         (None, _) => "-".into(),
-    };
-    match (context_used, context_window) {
-        (Some(used), Some(window)) if window > 0 => format!(
-            "{base} ({}/{} {}%)",
-            crate::lineage::format_token_count(used),
-            crate::lineage::format_token_count(window),
-            used.saturating_mul(100) / window,
-        ),
-        (Some(used), _) => format!("{base} ({})", crate::lineage::format_token_count(used)),
-        (None, _) => base,
     }
+}
+
+/// The modeline's detailed context indicator and the number of its text cells
+/// covered by the filled part of its background bar.
+fn modeline_context_usage_text(
+    used: Option<u64>,
+    window: Option<u64>,
+) -> Option<(String, usize)> {
+    let used = used?;
+    let Some(window) = window.filter(|window| *window > 0) else {
+        return Some((
+            format!("  {} used ", crate::lineage::format_token_count(used)),
+            0,
+        ));
+    };
+    let text = format!(
+        "  {}/{} {}% ",
+        crate::lineage::format_token_count(used),
+        crate::lineage::format_token_count(window),
+        used.saturating_mul(100) / window,
+    );
+    // The first space separates the gauge from the model name. The next and
+    // final spaces are padding within the bar itself.
+    let text_cells = UnicodeWidthStr::width(&text[1..]);
+    let filled_cells = (text_cells * used.min(window) as usize).div_ceil(window as usize);
+    Some((text, filled_cells))
 }
 
 fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
@@ -7831,6 +7839,7 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let approval_mode_label = s.and_then(approval_mode_modeline_label);
     let approval_mode_badge = approval_mode_label.map(|badge| format!("[{badge}]"));
+    let context_gauge = s.and_then(|s| modeline_context_usage_text(s.context_used, s.context_window));
     let mut search_status = None;
     if let Some(search) = app
         .program_popup
@@ -7876,8 +7885,8 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             &[]
         };
-    let modeline_before_approval_mode = format!(
-        " construct  {vim_mode}focus:{focus}  {sel}  {model}  ",
+    let modeline_before_context_gauge = format!(
+        " construct  {vim_mode}focus:{focus}  {sel}  {model}",
         vim_mode = vim_mode_label,
         focus = focus_label,
         sel = match s {
@@ -7885,15 +7894,32 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
             None => "-".into(),
         },
         model = match s {
-            Some(s) => modeline_model_text(
-                s.model.as_deref(),
-                s.effort.as_deref(),
-                s.context_used,
-                s.context_window,
-            ),
+            Some(s) => modeline_model_text(s.model.as_deref(), s.effort.as_deref()),
             None => "-".into(),
         },
     );
+    let modeline_before_approval_mode = format!(
+        "{modeline_before_context_gauge}{}  ",
+        context_gauge
+            .as_ref()
+            .map(|(text, _)| text.as_str())
+            .unwrap_or("")
+    );
+    if let Some((gauge, _)) = context_gauge.as_ref() {
+        let start_col = area
+            .x
+            .saturating_add(UnicodeWidthStr::width(modeline_before_context_gauge.as_str()) as u16);
+        let end_col = start_col
+            .saturating_add(UnicodeWidthStr::width(gauge.as_str()) as u16)
+            .min(area.x.saturating_add(area.width));
+        if end_col > start_col {
+            app.layout.modeline_context_gauge_hit = Some(crate::app::ModelineContextGaugeHit {
+                row: area.y,
+                start_col,
+                end_col,
+            });
+        }
+    }
     if approval_mode_label.is_some() {
         let start_col = area
             .x
@@ -7976,7 +8002,43 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     let mut hint_col = area
         .x
         .saturating_add(UnicodeWidthStr::width(modeline_before_approval_mode.as_str()) as u16);
-    spans.push(Span::raw(modeline_before_approval_mode));
+    spans.push(Span::raw(modeline_before_context_gauge));
+    if let Some((gauge, filled_cells)) = context_gauge {
+        let hovered = app
+            .mouse_pos
+            .zip(app.layout.modeline_context_gauge_hit)
+            .is_some_and(|((col, row), hit)| hit.contains(col, row));
+        for (index, ch) in gauge.chars().enumerate() {
+            let bar_cell = index > 0;
+            let background = if !bar_cell {
+                app.theme.modeline_bg
+            } else if index - 1 < filled_cells {
+                if hovered {
+                    app.theme.text
+                } else {
+                    app.theme.modeline_fg
+                }
+            } else {
+                app.theme.dim
+            };
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default()
+                    .bg(background)
+                    .fg(if bar_cell {
+                        app.theme.modeline_bg
+                    } else {
+                        app.theme.modeline_fg
+                    })
+                    .add_modifier(if hovered && bar_cell {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ));
+        }
+    }
+    spans.push(Span::raw("  "));
     if let Some(badge) = approval_mode_badge {
         let hovered = app
             .mouse_pos
@@ -8212,6 +8274,45 @@ fn render_modeline_approval_mode_tooltip(f: &mut Frame, app: &App) {
         f,
         &app.theme,
         &format!(" Approval mode: {label}. Click to cycle "),
+        hit.start_col,
+        hit.row.saturating_sub(2),
+    );
+}
+
+fn render_modeline_context_gauge_tooltip(f: &mut Frame, app: &App) {
+    let Some(hit) = app.layout.modeline_context_gauge_hit else {
+        return;
+    };
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    if !hit.contains(mx, my) {
+        return;
+    }
+    let Some(session) = app.selected_session() else {
+        return;
+    };
+    let Some(used) = session.context_used else {
+        return;
+    };
+    let text = if let Some(window) = session.context_window.filter(|window| *window > 0) {
+        let percent = used.saturating_mul(100) / window;
+        format!(
+            " Context: {} / {} tokens ({}%) ",
+            crate::lineage::format_token_count(used),
+            crate::lineage::format_token_count(window),
+            percent,
+        )
+    } else {
+        format!(
+            " Context: {} tokens used ",
+            crate::lineage::format_token_count(used),
+        )
+    };
+    render_button_tooltip(
+        f,
+        &app.theme,
+        &text,
         hit.start_col,
         hit.row.saturating_sub(2),
     );
@@ -18493,14 +18594,14 @@ mod tests {
 
     #[test]
     fn modeline_model_text_shows_dash_when_nothing_known() {
-        assert_eq!(modeline_model_text(None, None, None, None), "-");
-        assert_eq!(modeline_model_text(None, Some("high"), None, None), "-");
+        assert_eq!(modeline_model_text(None, None), "-");
+        assert_eq!(modeline_model_text(None, Some("high")), "-");
     }
 
     #[test]
     fn modeline_model_text_shows_bare_model_without_effort() {
         assert_eq!(
-            modeline_model_text(Some("gpt-5.6-terra"), None, None, None),
+            modeline_model_text(Some("gpt-5.6-terra"), None),
             "gpt-5.6-terra"
         );
     }
@@ -18508,33 +18609,26 @@ mod tests {
     #[test]
     fn modeline_model_text_shows_model_and_effort_together() {
         assert_eq!(
-            modeline_model_text(Some("gpt-5.6-terra"), Some("high"), None, None),
+            modeline_model_text(Some("gpt-5.6-terra"), Some("high")),
             "gpt-5.6-terra (high)"
         );
     }
 
     #[test]
-    fn modeline_model_text_appends_context_gauge() {
-        // Window known → used/window with an integer percent (spec 0104).
+    fn modeline_context_usage_shows_full_token_text_over_a_bar() {
         assert_eq!(
-            modeline_model_text(Some("gpt-5.6-terra"), Some("high"), Some(12_400), Some(258_400)),
-            "gpt-5.6-terra (high) (12k/258k 4%)"
+            modeline_context_usage_text(Some(12_400), Some(258_400)),
+            Some(("  12k/258k 4% ".to_string(), 1))
         );
-        // No window stated → bare usage, never a guessed percentage.
         assert_eq!(
-            modeline_model_text(Some("kimi-for-coding"), None, Some(74_200), None),
-            "kimi-for-coding (74k)"
+            modeline_context_usage_text(Some(74_200), None),
+            Some(("  74k used ".to_string(), 0))
         );
-        // A zero window (defensive) degrades to bare usage too.
         assert_eq!(
-            modeline_model_text(Some("m"), None, Some(500), Some(0)),
-            "m (500)"
+            modeline_context_usage_text(Some(500), Some(0)),
+            Some(("  500 used ".to_string(), 0))
         );
-        // No report yet → no gauge, even when a window somehow arrived.
-        assert_eq!(
-            modeline_model_text(Some("m"), None, None, Some(258_400)),
-            "m"
-        );
+        assert_eq!(modeline_context_usage_text(None, Some(258_400)), None);
     }
 
     #[test]

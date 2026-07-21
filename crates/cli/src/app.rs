@@ -3148,6 +3148,21 @@ impl ModelineApprovalModeHit {
     }
 }
 
+/// Hover target for the selected session's context-window gauge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelineContextGaugeHit {
+    pub row: u16,
+    pub start_col: u16,
+    /// Exclusive end column.
+    pub end_col: u16,
+}
+
+impl ModelineContextGaugeHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.start_col && col < self.end_col
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelineThemeHit {
     pub row: u16,
@@ -3255,6 +3270,8 @@ pub struct LayoutSnapshot {
     pub last_chat_areas: std::collections::HashMap<String, ratatui::layout::Rect>,
     /// Clickable approval-mode badge in the modeline for the selected session.
     pub modeline_approval_mode_hit: Option<ModelineApprovalModeHit>,
+    /// Hoverable context-window gauge in the modeline for the selected session.
+    pub modeline_context_gauge_hit: Option<ModelineContextGaugeHit>,
     /// Clickable theme label in the modeline status bar.
     pub modeline_theme_hit: Option<ModelineThemeHit>,
     /// Number of rows of the list pane currently in use (so a click
@@ -13574,6 +13591,7 @@ mod tests {
             minibuffer_area: Some(Rect::new(0, 29, 100, 4)),
             last_chat_areas: std::collections::HashMap::new(),
             modeline_approval_mode_hit: None,
+            modeline_context_gauge_hit: None,
             modeline_theme_hit: None,
             list_row_count: 0,
             list_items_area: None,
