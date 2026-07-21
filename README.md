@@ -1,6 +1,7 @@
 <div align="center">
   <h1>construct</h1>
   <p><strong>A terminal-native agentic development environment.</strong></p>
+  <p><a href="https://discord.gg/89fPgTKsRF">discord</a> · <a href="https://zarvis.ai">website</a></p>
   <img src="https://raw.githubusercontent.com/construct-worlds/construct/52849f56c902397d6729ec286293064c5b15bcfe/demos/lineage-program-run.gif" alt="construct lineage and program run">
 </div>
 
