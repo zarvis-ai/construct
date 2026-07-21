@@ -22,6 +22,9 @@ the exact `used / window` token counts. The bar is shown only when the
 harness states its window; the window is never guessed from model names or
 hardcoded tables outside the harness's own report.
 
+Clicking the indicator toggles the client-local display between that compact
+bar and the detailed `(used/window %)` text representation.
+
 ## Reason
 
 Context pressure is the operational number users watch while driving

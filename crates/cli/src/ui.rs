@@ -7809,6 +7809,19 @@ fn modeline_context_gauge_text(used: Option<u64>, window: Option<u64>) -> Option
     Some(format!(" [{cells}] ({}%)", percent.min(999)))
 }
 
+/// The original detailed context indicator, available by clicking the compact
+/// bar in the modeline.
+fn modeline_context_usage_text(used: Option<u64>, window: Option<u64>) -> Option<String> {
+    let used = used?;
+    let window = window.filter(|window| *window > 0)?;
+    Some(format!(
+        " ({}/{} {}%)",
+        crate::lineage::format_token_count(used),
+        crate::lineage::format_token_count(window),
+        used.saturating_mul(100) / window,
+    ))
+}
+
 fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     let s = app.selected_session();
     let conn = if app.connected { "" } else { " disconnected!" };
@@ -7828,7 +7841,13 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let approval_mode_label = s.and_then(approval_mode_modeline_label);
     let approval_mode_badge = approval_mode_label.map(|badge| format!("[{badge}]"));
-    let context_gauge = s.and_then(|s| modeline_context_gauge_text(s.context_used, s.context_window));
+    let context_gauge = s.and_then(|s| {
+        if app.context_gauge_as_text {
+            modeline_context_usage_text(s.context_used, s.context_window)
+        } else {
+            modeline_context_gauge_text(s.context_used, s.context_window)
+        }
+    });
     let mut search_status = None;
     if let Some(search) = app
         .program_popup
@@ -8265,10 +8284,11 @@ fn render_modeline_context_gauge_tooltip(f: &mut Frame, app: &App) {
         f,
         &app.theme,
         &format!(
-            " Context: {} / {} tokens ({}%) ",
+            " Context: {} / {} tokens ({}%). Click to switch to {} ",
             crate::lineage::format_token_count(used),
             crate::lineage::format_token_count(window),
             percent,
+            if app.context_gauge_as_text { "bar" } else { "text" },
         ),
         hit.start_col,
         hit.row.saturating_sub(2),
@@ -18580,6 +18600,10 @@ mod tests {
         assert_eq!(modeline_context_gauge_text(Some(74_200), None), None);
         assert_eq!(modeline_context_gauge_text(Some(500), Some(0)), None);
         assert_eq!(modeline_context_gauge_text(None, Some(258_400)), None);
+        assert_eq!(
+            modeline_context_usage_text(Some(12_400), Some(258_400)),
+            Some(" (12k/258k 4%)".to_string())
+        );
     }
 
     #[test]

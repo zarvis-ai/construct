@@ -1373,6 +1373,9 @@ pub struct App {
     pub harness_usage_last_query: HashMap<String, Instant>,
     pub theme: crate::theme::Theme,
     pub theme_name: crate::theme::ThemeName,
+    /// Render the context indicator as its detailed text form rather than a
+    /// compact bar. Toggled by clicking the indicator in the modeline.
+    pub context_gauge_as_text: bool,
     terminal_background_is_light: Option<bool>,
     pub help_visible: bool,
     /// Wrapped-row scroll offset into the help dialog's content, clamped to
@@ -3828,6 +3831,7 @@ async fn run_with_socket_initial_selection(
         harness_usage_last_query: HashMap::new(),
         theme,
         theme_name: theme_config.active_name(None),
+        context_gauge_as_text: false,
         terminal_background_is_light: None,
         help_visible: false,
         help_scroll_offset: 0,
@@ -9271,6 +9275,14 @@ impl App {
             self.cycle_approval_mode_silent().await;
             return;
         }
+        if self
+            .layout
+            .modeline_context_gauge_hit
+            .is_some_and(|hit| hit.contains(col, row))
+        {
+            self.context_gauge_as_text = !self.context_gauge_as_text;
+            return;
+        }
         // Matrix-rain horizontal reveal word: jump to the session that
         // produced it (issue #140). Checked before the pane hit-tests —
         // the rain panel is its own region, so this never shadows a real
@@ -13695,6 +13707,7 @@ mod tests {
             harness_usage_last_query: HashMap::new(),
             theme: crate::theme::Theme::default(),
             theme_name: crate::theme::ThemeName::Matrix,
+            context_gauge_as_text: false,
             terminal_background_is_light: None,
             help_visible: false,
             help_scroll_offset: 0,
