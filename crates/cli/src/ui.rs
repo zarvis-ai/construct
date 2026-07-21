@@ -7794,17 +7794,23 @@ fn modeline_model_text(model: Option<&str>, effort: Option<&str>) -> String {
     }
 }
 
-/// The modeline's detailed context indicator. Exact counts remain available
-/// from the same hover tooltip as a more scannable label.
-fn modeline_context_usage_text(used: Option<u64>, window: Option<u64>) -> Option<String> {
+/// The modeline's detailed context indicator and the number of its text cells
+/// covered by the filled part of its background bar.
+fn modeline_context_usage_text(
+    used: Option<u64>,
+    window: Option<u64>,
+) -> Option<(String, usize)> {
     let used = used?;
     let window = window.filter(|window| *window > 0)?;
-    Some(format!(
-        " ({}/{} {}%)",
+    let text = format!(
+        " {}/{} {}%",
         crate::lineage::format_token_count(used),
         crate::lineage::format_token_count(window),
         used.saturating_mul(100) / window,
-    ))
+    );
+    let text_cells = UnicodeWidthStr::width(text.trim_start());
+    let filled_cells = (text_cells * used.min(window) as usize).div_ceil(window as usize);
+    Some((text, filled_cells))
 }
 
 fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
@@ -7887,14 +7893,17 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     );
     let modeline_before_approval_mode = format!(
         "{modeline_before_context_gauge}{}  ",
-        context_gauge.as_deref().unwrap_or("")
+        context_gauge
+            .as_ref()
+            .map(|(text, _)| text.as_str())
+            .unwrap_or("")
     );
-    if let Some(gauge) = context_gauge.as_deref() {
+    if let Some((gauge, _)) = context_gauge.as_ref() {
         let start_col = area
             .x
             .saturating_add(UnicodeWidthStr::width(modeline_before_context_gauge.as_str()) as u16);
         let end_col = start_col
-            .saturating_add(UnicodeWidthStr::width(gauge) as u16)
+            .saturating_add(UnicodeWidthStr::width(gauge.as_str()) as u16)
             .min(area.x.saturating_add(area.width));
         if end_col > start_col {
             app.layout.modeline_context_gauge_hit = Some(crate::app::ModelineContextGaugeHit {
@@ -7987,16 +7996,40 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
         .x
         .saturating_add(UnicodeWidthStr::width(modeline_before_approval_mode.as_str()) as u16);
     spans.push(Span::raw(modeline_before_context_gauge));
-    if let Some(gauge) = context_gauge {
+    if let Some((gauge, filled_cells)) = context_gauge {
         let hovered = app
             .mouse_pos
             .zip(app.layout.modeline_context_gauge_hit)
             .is_some_and(|((col, row), hit)| hit.contains(col, row));
-        let style = Style::default()
-            .bg(app.theme.modeline_bg)
-            .fg(if hovered { app.theme.text } else { app.theme.modeline_fg })
-            .add_modifier(if hovered { Modifier::BOLD } else { Modifier::empty() });
-        spans.push(Span::styled(gauge, style));
+        for (index, ch) in gauge.chars().enumerate() {
+            let bar_cell = index > 0;
+            let background = if !bar_cell {
+                app.theme.modeline_bg
+            } else if index - 1 < filled_cells {
+                if hovered {
+                    app.theme.text
+                } else {
+                    app.theme.modeline_fg
+                }
+            } else {
+                app.theme.dim
+            };
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default()
+                    .bg(background)
+                    .fg(if bar_cell {
+                        app.theme.modeline_bg
+                    } else {
+                        app.theme.modeline_fg
+                    })
+                    .add_modifier(if hovered && bar_cell {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ));
+        }
     }
     spans.push(Span::raw("  "));
     if let Some(badge) = approval_mode_badge {
@@ -18570,10 +18603,10 @@ mod tests {
     }
 
     #[test]
-    fn modeline_context_usage_shows_full_token_text() {
+    fn modeline_context_usage_shows_full_token_text_over_a_bar() {
         assert_eq!(
             modeline_context_usage_text(Some(12_400), Some(258_400)),
-            Some(" (12k/258k 4%)".to_string())
+            Some((" 12k/258k 4%".to_string(), 1))
         );
         assert_eq!(modeline_context_usage_text(Some(74_200), None), None);
         assert_eq!(modeline_context_usage_text(Some(500), Some(0)), None);

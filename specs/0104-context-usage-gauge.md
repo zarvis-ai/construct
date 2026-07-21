@@ -17,10 +17,13 @@ reports replace old ones, a context reset clears it, and the last
 report is recovered from the transcript at load.
 
 The TUI modeline renders the gauge immediately after the model name as
-`(used/window %)` — for example `(12.4k/258k 5%)`. Hovering the text reveals
-the exact `used / window` token counts. The indicator is shown only when the
-harness states its window; the window is never guessed from model names or
-hardcoded tables outside the harness's own report.
+`used/window %` — for example `12.4k/258k 5%` — with that label drawn over a
+proportional background bar. Used capacity uses the normal modeline color and
+remaining capacity is dimmed, while the label remains readable on top.
+Hovering the label reveals the exact `used / window` token counts. The
+indicator is shown only when the harness states its window; the window is
+never guessed from model names or hardcoded tables outside the harness's own
+report.
 
 ## Reason
 
@@ -53,7 +56,7 @@ the different question "how full is this conversation right now?".
 ## Examples
 
 - A codex session that just consumed 12,400 prompt tokens against its
-  258k window shows `(12.4k/258k 5%)` after the model name; hover shows
+  258k window shows `12.4k/258k 5%` after the model name, over its bar; hover shows
   `12.4k / 258k tokens (5%)`.
 - A kimi session (no window reported), a brand-new session, and a bare shell
   show no gauge.
