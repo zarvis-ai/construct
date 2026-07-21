@@ -161,6 +161,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.lineage_hscrollbar = None;
     app.layout.lineage_box_hits.clear();
     app.layout.lineage_subagent_toggle_hits.clear();
+    app.layout.lineage_segment_tooltip = None;
     app.window_pane_sizes.clear();
     app.terminal_replayed_sessions_this_frame.clear();
     app.layout.dynamic_ui_popover_area = None;
@@ -315,6 +316,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_browser_preview_close_tooltip(f, app);
     render_list_title_button_tooltips(f, app);
     render_view_uncollapse_tooltip(f, app);
+    render_lineage_segment_tooltip(f, app);
     render_harness_unavailable_tooltip(f, app);
     render_harness_hover_tooltip(f, app);
     render_modeline_approval_mode_tooltip(f, app);
@@ -1822,6 +1824,17 @@ fn render_diamond_tooltip(f: &mut Frame, app: &App) {
     render_tooltip_at(f, &app.theme, label, dx, dy, 2, -1);
 }
 
+/// Hover detail for a lineage turn-info line (spec 0103): the window's
+/// message count plus its input/output/cached token breakdown. Armed by
+/// the lineage section's hit walk when the pointer sits on a token-bearing
+/// segment label.
+fn render_lineage_segment_tooltip(f: &mut Frame, app: &App) {
+    let Some((anchor, label)) = app.layout.lineage_segment_tooltip.clone() else {
+        return;
+    };
+    render_tooltip_at(f, &app.theme, &label, anchor.x, anchor.y, 0, -1);
+}
+
 fn pin_strip_height(total_h: u16) -> u16 {
     (total_h / 3).clamp(7, 18)
 }
@@ -2611,6 +2624,25 @@ fn render_lineage_section(
                         area,
                     });
                 continue;
+            }
+            // Hovering a token-bearing turn-info line arms its detail
+            // tooltip (spec 0103) — painted by the frame's tooltip pass.
+            if let crate::lineage::LineageSpan::Segment {
+                delta_events,
+                tokens,
+                ..
+            } = &span.role
+            {
+                if !tokens.is_zero()
+                    && app
+                        .mouse_pos
+                        .is_some_and(|(mx, my)| contains_rect(area, mx, my))
+                {
+                    app.layout.lineage_segment_tooltip = Some((
+                        area,
+                        crate::lineage::segment_tooltip_label(*delta_events, tokens),
+                    ));
+                }
             }
             let Some(owner) = span.role.owner() else {
                 continue;
@@ -17650,6 +17682,7 @@ mod tests {
             at_ms: 1_000,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         let mut sub = lineage_test_summary("s");
@@ -17774,6 +17807,7 @@ mod tests {
             at_ms: 2_000,
             merged_busy_ms: 0,
             merged_message_count: 0,
+            merged_tokens: Default::default(),
             merged_seq: 2,
         });
         let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
@@ -17820,6 +17854,7 @@ mod tests {
             at_ms: 2_000,
             merged_busy_ms: 0,
             merged_message_count: 0,
+            merged_tokens: Default::default(),
             merged_seq: 2,
         });
         let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
@@ -17853,6 +17888,7 @@ mod tests {
             at_ms: 1_000,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         let sessions = vec![root, fork];
@@ -17962,6 +17998,7 @@ mod tests {
                 at_ms: 0,
                 parent_busy_ms: 0,
                 parent_message_count: 0,
+                parent_tokens: Default::default(),
                 is_reset_snapshot: false,
             });
             sessions.push(f);
@@ -18562,6 +18599,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: construct_protocol::SessionKind::User,
             archived: false,
@@ -18582,6 +18620,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
 

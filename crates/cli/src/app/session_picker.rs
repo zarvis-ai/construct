@@ -852,6 +852,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: construct_protocol::SessionKind::User,
             archived: false,

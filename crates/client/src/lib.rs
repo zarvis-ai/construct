@@ -541,6 +541,8 @@ impl Client {
                     // message-only counterpart to `transcript_seq`, so
                     // lineage windows can count actual messages.
                     parent_message_count: src.message_count,
+                    // ...and the token counterpart (spec 0103).
+                    parent_tokens: src.tokens,
                     // A user-initiated fork through this path, never an
                     // automatic reset snapshot (spec 0085) — those are
                     // synthesized entirely daemon-side, never through

@@ -383,6 +383,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: construct_protocol::SessionKind::User,
             archived: false,
@@ -421,6 +422,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         s
@@ -657,6 +659,7 @@ mod tests {
                 at_ms: 0,
                 merged_busy_ms: 0,
                 merged_message_count: 0,
+                merged_tokens: Default::default(),
                 merged_seq: 0,
             });
             fork.archived = true;
@@ -689,6 +692,7 @@ mod tests {
             at_ms: 0,
             merged_busy_ms: 0,
             merged_message_count: 0,
+            merged_tokens: Default::default(),
             merged_seq: 0,
         });
         fork.archived = true;

@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use construct_protocol::{ForkMergeMode, SessionKind, SessionState, SessionSummary};
+use construct_protocol::{ForkMergeMode, SessionKind, SessionState, SessionSummary, TokenTally};
 
 /// Levels rendered below the tree's root before a subtree collapses into a
 /// "+N more" marker (spec: "depth/breadth cap").
@@ -314,6 +314,11 @@ pub enum LineageSpan {
         /// / `ForkedFrom::transcript_seq` / `ForkMerge::merged_seq` units —
         /// all the same transcript sequence counter).
         delta_events: u64,
+        /// Token consumption within this window (spec 0103) — the delta
+        /// between the lane's boundary stamps. All-zero when untracked;
+        /// the label then falls back to the message count, and hover has
+        /// no token detail to show.
+        tokens: TokenTally,
         /// Start of this window, epoch ms.
         start_ms: i64,
         /// End of this window, epoch ms; `None` = still open (measured
@@ -770,6 +775,7 @@ fn put_segment(
     y: usize,
     lane: usize,
     delta_events: u64,
+    tokens: TokenTally,
     start_ms: i64,
     end_ms: Option<i64>,
     now_ms: i64,
@@ -801,8 +807,8 @@ fn put_segment(
     // Running spans in this window); wall-clock span as the legacy
     // fallback for records without busy data.
     let text = match busy_ms {
-        Some(b) => segment_label_busy(delta_events, b),
-        None => segment_label(delta_events, start_ms, end_ms, now_ms),
+        Some(b) => segment_label_busy(delta_events, tokens, b),
+        None => segment_label(delta_events, tokens, start_ms, end_ms, now_ms),
     };
     let w = UnicodeWidthStr::width(text.as_str());
     c.put(
@@ -811,6 +817,7 @@ fn put_segment(
         &text,
         &LineageSpan::Segment {
             delta_events,
+            tokens,
             start_ms,
             end_ms,
             session_id: owner.to_string(),
@@ -854,10 +861,13 @@ struct Lane<'a> {
     /// The parent's `message_count` at fork time (`ForkedFrom::
     /// parent_message_count`); 0 when untracked (legacy records).
     fork_msgs: u64,
-    /// `(at_ms, merged_seq, merged_busy_ms)` for forks that merged back
-    /// (`Result`) — such a lane ends at its merge arrow instead of an
-    /// `End` event.
-    merge: Option<(i64, u64, u64, u64)>,
+    /// The parent's token tally at fork time (`ForkedFrom::parent_tokens`);
+    /// all-zero when untracked (legacy records).
+    fork_tokens: TokenTally,
+    /// `(at_ms, merged_seq, merged_busy_ms, merged_message_count,
+    /// merged_tokens)` for forks that merged back (`Result`) — such a lane
+    /// ends at its merge arrow instead of an `End` event.
+    merge: Option<(i64, u64, u64, u64, TokenTally)>,
     /// `(at_ms, label end, outcome)` for every other lane's end: a
     /// discarded fork (at discard time), a session that went Done/Errored
     /// (at `last_event_at`), or a live session (at "now", open-ended).
@@ -881,12 +891,17 @@ struct Lane<'a> {
     /// The session's lifetime chat-message tally (`SessionSummary::
     /// message_count`); 0 when untracked (legacy records).
     msgs_total: u64,
+    /// The session's lifetime token tally (`SessionSummary::tokens`);
+    /// all-zero when untracked (legacy records).
+    tokens_total: TokenTally,
     // Running state, filled in as the global walk proceeds.
     cp_seq: u64,
     cp_ms: i64,
     cp_busy: u64,
     /// Message-count checkpoint mirroring `cp_seq`.
     cp_msgs: u64,
+    /// Token-tally checkpoint mirroring `cp_seq`.
+    cp_tokens: TokenTally,
     x_abs: usize,
     lane_col: usize,
     box_bottom: usize,
@@ -940,6 +955,7 @@ fn collect_lanes<'a>(
                     m.merged_seq,
                     m.merged_busy_ms,
                     m.merged_message_count,
+                    m.merged_tokens,
                 )
             })
     } else {
@@ -972,7 +988,7 @@ fn collect_lanes<'a>(
         Some((now_ms.max(box_ms), label_end, None))
     };
     let close_ms = merge
-        .map(|(at, _, _, _)| at)
+        .map(|(at, _, _, _, _)| at)
         .or(end.map(|(at, _, _)| at))
         .unwrap();
     let idx = lanes.len();
@@ -984,6 +1000,7 @@ fn collect_lanes<'a>(
         fork_seq: forked.map(|f| f.transcript_seq),
         fork_busy: forked.map(|f| f.parent_busy_ms).unwrap_or(0),
         fork_msgs: forked.map(|f| f.parent_message_count).unwrap_or(0),
+        fork_tokens: forked.map(|f| f.parent_tokens).unwrap_or_default(),
         merge,
         end,
         close_ms,
@@ -992,10 +1009,12 @@ fn collect_lanes<'a>(
         label_lines: wrap_box_label(&node_box_label(summary, &node.session_id)),
         busy_total: summary.map(|s| s.busy_ms_at(now_ms)).unwrap_or(0),
         msgs_total: summary.map(|s| s.message_count).unwrap_or(0),
+        tokens_total: summary.map(|s| s.tokens).unwrap_or_default(),
         cp_seq: 0,
         cp_ms: box_ms,
         cp_busy: 0,
         cp_msgs: 0,
+        cp_tokens: TokenTally::default(),
         x_abs: 0,
         lane_col: 0,
         box_bottom: 0,
@@ -1074,7 +1093,7 @@ fn build_events(lanes: &[Lane]) -> Vec<(i64, u8, usize)> {
     let mut events: Vec<(i64, u8, usize)> = Vec::new();
     for (i, lane) in lanes.iter().enumerate() {
         events.push((lane.box_ms, EV_BOX, i));
-        if let Some((at, _, _, _)) = lane.merge {
+        if let Some((at, _, _, _, _)) = lane.merge {
             events.push((at, EV_MERGE, i));
         }
         if let Some((at, _, _)) = lane.end {
@@ -1210,11 +1229,13 @@ fn layout_tree(
                         } else {
                             d
                         };
+                        let tokens = lanes[i].fork_tokens.saturating_sub(&lanes[p].cp_tokens);
                         put_segment(
                             c,
                             cur,
                             lanes[p].lane_col,
                             shown,
+                            tokens,
                             lanes[p].cp_ms,
                             Some(lanes[i].box_ms),
                             now_ms,
@@ -1228,6 +1249,7 @@ fn layout_tree(
                     lanes[p].cp_ms = lanes[i].box_ms;
                     lanes[p].cp_busy = lanes[p].cp_busy.max(lanes[i].fork_busy);
                     lanes[p].cp_msgs = lanes[p].cp_msgs.max(lanes[i].fork_msgs);
+                    lanes[p].cp_tokens = lanes[p].cp_tokens.max(&lanes[i].fork_tokens);
                 }
                 // Icon-only arrow label — the glyph alone (⑂ / ▸ / ↺) marks
                 // the edge kind. A fork synthesized automatically by a
@@ -1358,7 +1380,8 @@ fn layout_tree(
                 gi += 1;
             }
             EV_MERGE => {
-                let (at, mseq, mbusy, mmsgs) = lanes[i].merge.expect("merge event has merge data");
+                let (at, mseq, mbusy, mmsgs, mtokens) =
+                    lanes[i].merge.expect("merge event has merge data");
                 let p = lanes[i].parent.expect("a merging fork has a parent");
                 let dp = mseq.saturating_sub(lanes[p].cp_seq);
                 let df = lanes[i]
@@ -1383,11 +1406,13 @@ fn layout_tree(
                         } else {
                             dp
                         };
+                        let tokens = mtokens.saturating_sub(&lanes[p].cp_tokens);
                         let end_x = put_segment(
                             c,
                             row,
                             lanes[p].lane_col,
                             shown,
+                            tokens,
                             lanes[p].cp_ms,
                             Some(at),
                             now_ms,
@@ -1407,11 +1432,13 @@ fn layout_tree(
                         } else {
                             df
                         };
+                        let tokens = lanes[i].tokens_total.saturating_sub(&lanes[i].cp_tokens);
                         put_segment(
                             c,
                             row,
                             lanes[i].lane_col,
                             shown,
+                            tokens,
                             lanes[i].cp_ms,
                             Some(at),
                             now_ms,
@@ -1465,6 +1492,7 @@ fn layout_tree(
                 lanes[p].cp_ms = at;
                 lanes[p].cp_busy = lanes[p].cp_busy.max(mbusy);
                 lanes[p].cp_msgs = lanes[p].cp_msgs.max(mmsgs);
+                lanes[p].cp_tokens = lanes[p].cp_tokens.max(&mtokens);
                 lanes[p].last_row = lanes[p].last_row.max(cur);
                 lanes[i].last_row = cur;
                 lanes[i].ended = true;
@@ -1525,11 +1553,13 @@ fn layout_tree(
                         } else {
                             d
                         };
+                        let tokens = lanes[j].tokens_total.saturating_sub(&lanes[j].cp_tokens);
                         row_end_x = put_segment(
                             c,
                             cur,
                             lanes[j].lane_col,
                             shown,
+                            tokens,
                             lanes[j].cp_ms,
                             label_end,
                             now_ms,
@@ -1670,6 +1700,7 @@ pub fn flatten_rails(
                     row: usize,
                     rail_col: usize,
                     delta: u64,
+                    tokens: TokenTally,
                     start: i64,
                     end: Option<i64>,
                     outcome: Option<bool>,
@@ -1695,8 +1726,8 @@ pub fn flatten_rails(
             ),
         }
         let text = match busy {
-            Some(b) => segment_label_busy(delta, b),
-            None => segment_label(delta, start, end, now_ms),
+            Some(b) => segment_label_busy(delta, tokens, b),
+            None => segment_label(delta, tokens, start, end, now_ms),
         };
         c.put(
             row,
@@ -1704,6 +1735,7 @@ pub fn flatten_rails(
             &text,
             &LineageSpan::Segment {
                 delta_events: delta,
+                tokens,
                 start_ms: start,
                 end_ms: end,
                 session_id: owner.to_string(),
@@ -1783,11 +1815,13 @@ pub fn flatten_rails(
                         } else {
                             d
                         };
+                        let tokens = lanes[i].fork_tokens.saturating_sub(&lanes[p].cp_tokens);
                         put_info(
                             &mut c,
                             cur,
                             col(rail_of[p]),
                             shown,
+                            tokens,
                             lanes[p].cp_ms,
                             Some(lanes[i].box_ms),
                             None,
@@ -1801,6 +1835,7 @@ pub fn flatten_rails(
                     lanes[p].cp_ms = lanes[i].box_ms;
                     lanes[p].cp_busy = lanes[p].cp_busy.max(lanes[i].fork_busy);
                     lanes[p].cp_msgs = lanes[p].cp_msgs.max(lanes[i].fork_msgs);
+                    lanes[p].cp_tokens = lanes[p].cp_tokens.max(&lanes[i].fork_tokens);
                 }
                 let (pc, cc) = (col(rail_of[p]), col(rail_of[i]));
                 let child_border = LineageSpan::Border {
@@ -1854,7 +1889,8 @@ pub fn flatten_rails(
                 gi += 1;
             }
             EV_MERGE => {
-                let (at, mseq, mbusy, mmsgs) = lanes[i].merge.expect("merge event has merge data");
+                let (at, mseq, mbusy, mmsgs, mtokens) =
+                    lanes[i].merge.expect("merge event has merge data");
                 let p = lanes[i].parent.expect("a merging fork has a parent");
                 let dp = mseq.saturating_sub(lanes[p].cp_seq);
                 if dp > 0 {
@@ -1865,11 +1901,13 @@ pub fn flatten_rails(
                     } else {
                         dp
                     };
+                    let tokens = mtokens.saturating_sub(&lanes[p].cp_tokens);
                     put_info(
                         &mut c,
                         cur,
                         col(rail_of[p]),
                         shown,
+                        tokens,
                         lanes[p].cp_ms,
                         Some(at),
                         None,
@@ -1892,11 +1930,13 @@ pub fn flatten_rails(
                     } else {
                         df
                     };
+                    let tokens = lanes[i].tokens_total.saturating_sub(&lanes[i].cp_tokens);
                     put_info(
                         &mut c,
                         cur,
                         col(rail_of[i]),
                         shown,
+                        tokens,
                         lanes[i].cp_ms,
                         Some(at),
                         Some(true),
@@ -1924,6 +1964,7 @@ pub fn flatten_rails(
                 lanes[p].cp_ms = at;
                 lanes[p].cp_busy = lanes[p].cp_busy.max(mbusy);
                 lanes[p].cp_msgs = lanes[p].cp_msgs.max(mmsgs);
+                lanes[p].cp_tokens = lanes[p].cp_tokens.max(&mtokens);
                 last_row[i] = last_row[i].max(cur);
                 last_row[p] = last_row[p].max(cur);
                 ended[i] = true;
@@ -1960,11 +2001,13 @@ pub fn flatten_rails(
                         } else {
                             d
                         };
+                        let tokens = lanes[j].tokens_total.saturating_sub(&lanes[j].cp_tokens);
                         put_info(
                             &mut c,
                             cur,
                             col(rail_of[j]),
                             shown,
+                            tokens,
                             lanes[j].cp_ms,
                             label_end,
                             outcome,
@@ -2026,18 +2069,18 @@ pub fn format_duration_ms(ms: u64) -> String {
     }
 }
 
-/// [`segment_label`]'s compute-time sibling: `"N msg(s) · <summed busy>"` —
+/// [`segment_label`]'s compute-time sibling: `"<count> · <summed busy>"` —
 /// the total time the session actually spent computing within the window,
 /// not the wall-clock span between its boundary events.
-pub fn segment_label_busy(delta_events: u64, busy_ms: u64) -> String {
-    let unit = if delta_events == 1 { "msg" } else { "msgs" };
+pub fn segment_label_busy(delta_events: u64, tokens: TokenTally, busy_ms: u64) -> String {
     format!(
-        "{delta_events} {unit} \u{00b7} {}",
+        "{} \u{00b7} {}",
+        segment_count_label(delta_events, tokens),
         format_duration_ms(busy_ms)
     )
 }
 
-/// Renderable text for one activity-segment row: `"N msg(s) · elapsed"`.
+/// Renderable text for one activity-segment row: `"<count> · elapsed"`.
 /// `end_ms` is the segment's own end when known, else `now_ms` (the render
 /// frame's live clock) — same split `render_lineage_row` used to take
 /// `now_ms` for per-node stats before those moved to segments. Cost is
@@ -2045,10 +2088,66 @@ pub fn segment_label_busy(delta_events: u64, busy_ms: u64) -> String {
 /// a single cumulative total on `SessionSummary`, with no per-checkpoint
 /// snapshot the way `event_count` has via `transcript_seq`/`merged_seq`, so
 /// there's no correct way to attribute it to one window rather than another.
-pub fn segment_label(delta_events: u64, start_ms: i64, end_ms: Option<i64>, now_ms: i64) -> String {
+pub fn segment_label(
+    delta_events: u64,
+    tokens: TokenTally,
+    start_ms: i64,
+    end_ms: Option<i64>,
+    now_ms: i64,
+) -> String {
     let elapsed = format_elapsed_ms(start_ms, end_ms.unwrap_or(now_ms));
+    format!(
+        "{} \u{00b7} {elapsed}",
+        segment_count_label(delta_events, tokens)
+    )
+}
+
+/// The count half of a turn-info label: token volume (input + output) when
+/// the window has tracked token data, message count otherwise (spec 0103).
+pub fn segment_count_label(delta_events: u64, tokens: TokenTally) -> String {
+    if tokens.total() > 0 {
+        format!("{} tok", format_token_count(tokens.total()))
+    } else {
+        let unit = if delta_events == 1 { "msg" } else { "msgs" };
+        format!("{delta_events} {unit}")
+    }
+}
+
+/// Hover detail for a turn-info line (spec 0103): the window's message
+/// count plus its token breakdown. A window with no output tokens shows a
+/// single total instead of fabricating an in/out split (codex reports one
+/// unsplit figure); the cached part appears only when the provider
+/// reported prompt-cache reads.
+pub fn segment_tooltip_label(delta_events: u64, tokens: &TokenTally) -> String {
     let unit = if delta_events == 1 { "msg" } else { "msgs" };
-    format!("{delta_events} {unit} \u{00b7} {elapsed}")
+    let mut parts = vec![format!("{delta_events} {unit}")];
+    if tokens.output == 0 {
+        parts.push(format!("{} tok total", format_token_count(tokens.total())));
+    } else {
+        parts.push(format!("in {}", format_token_count(tokens.input)));
+        parts.push(format!("out {}", format_token_count(tokens.output)));
+    }
+    if tokens.cached > 0 {
+        parts.push(format!("cached {}", format_token_count(tokens.cached)));
+    }
+    format!(" {} ", parts.join(" \u{00b7} "))
+}
+
+/// Compact human token count: `950`, `4.2k`, `87k`, `1.3M`. One decimal
+/// only while it's informative (below one order of magnitude past the
+/// unit), so labels stay narrow.
+pub fn format_token_count(n: u64) -> String {
+    if n >= 10_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 10_000 {
+        format!("{}k", n / 1_000)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -2084,6 +2183,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: SessionKind::User,
             archived: false,
@@ -2101,6 +2201,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         s
@@ -2123,6 +2224,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: true,
         });
         s
@@ -2143,6 +2245,7 @@ mod tests {
             at_ms,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         s
@@ -2159,6 +2262,7 @@ mod tests {
             at_ms,
             merged_busy_ms: 0,
             merged_message_count: 0,
+            merged_tokens: Default::default(),
             merged_seq,
         });
         s
@@ -2385,6 +2489,7 @@ mod tests {
             at_ms: 0,
             merged_busy_ms: 0,
             merged_message_count: 0,
+            merged_tokens: Default::default(),
             merged_seq: 0,
         });
         assert_eq!(ForkStatus::of(&open), ForkStatus::Merged);
@@ -2394,6 +2499,7 @@ mod tests {
             at_ms: 0,
             merged_busy_ms: 0,
             merged_message_count: 0,
+            merged_tokens: Default::default(),
             merged_seq: 0,
         });
         assert_eq!(ForkStatus::of(&open), ForkStatus::Discarded);
@@ -2735,6 +2841,71 @@ mod tests {
             "2 msgs · 1m00s".to_string(), // parent 5→7 while the fork ran
             "2 msgs · 1m30s".to_string(), // the fork's own two messages
             "1 msg · 1m30s".to_string(),  // parent 7→8 after merge (singular)
+        ];
+        assert_eq!(segment_texts(&flatten(&tree, &sessions, 800_000)), expect);
+        assert_eq!(
+            segment_texts(&flatten_rails(&tree, &sessions, 800_000).0),
+            expect
+        );
+    }
+
+    #[test]
+    fn turn_info_prefers_token_deltas_when_tracked() {
+        // Same scenario as the message-count test, now with token tallies
+        // stamped at the same boundaries (spec 0103): every window labels
+        // its token volume — the input+output delta between its boundary
+        // stamps — instead of the message count.
+        let mut root = with_event_count(with_created_at_ms(base("root"), 0), 20);
+        root.busy_ms = 400_000;
+        root.message_count = 8;
+        root.tokens = TokenTally {
+            input: 100_000,
+            output: 12_000,
+            cached: 80_000,
+        };
+        let mut fork = merged_at(
+            with_event_count(
+                with_created_at_ms(forked_from_at(base("f"), "root", 12, 300_000), 300_000),
+                2,
+            ),
+            ForkMergeMode::Result,
+            15,
+            500_000,
+        );
+        {
+            let ff = fork.forked_from.as_mut().unwrap();
+            ff.parent_busy_ms = 250_000;
+            ff.parent_message_count = 5;
+            ff.parent_tokens = TokenTally {
+                input: 40_000,
+                output: 2_000,
+                cached: 30_000,
+            };
+        }
+        {
+            let m = fork.merge.as_mut().unwrap();
+            m.merged_busy_ms = 310_000;
+            m.merged_message_count = 7;
+            m.merged_tokens = TokenTally {
+                input: 60_000,
+                output: 3_000,
+                cached: 45_000,
+            };
+        }
+        fork.busy_ms = 90_000;
+        fork.message_count = 2;
+        fork.tokens = TokenTally {
+            input: 9_000,
+            output: 500,
+            cached: 6_000,
+        };
+        let sessions = vec![root, fork];
+        let tree = build_tree("root", &sessions).unwrap();
+        let expect = vec![
+            "42k tok · 4m10s".to_string(),  // 42_000 while the fork split off
+            "21k tok · 1m00s".to_string(),  // parent 42k→63k while the fork ran
+            "9.5k tok · 1m30s".to_string(), // the fork's own consumption
+            "49k tok · 1m30s".to_string(),  // parent 63k→112k after merge
         ];
         assert_eq!(segment_texts(&flatten(&tree, &sessions, 800_000)), expect);
         assert_eq!(
@@ -3290,14 +3461,14 @@ mod tests {
 
     #[test]
     fn segment_label_reports_message_count_and_elapsed() {
-        let label = segment_label(42, 0, Some(65_000), 999_999);
+        let label = segment_label(42, TokenTally::default(), 0, Some(65_000), 999_999);
         assert!(label.contains("42 msgs"));
         assert!(label.contains("1m05s"));
     }
 
     #[test]
     fn segment_label_singular_for_one_message() {
-        let label = segment_label(1, 0, Some(1_000), 999_999);
+        let label = segment_label(1, TokenTally::default(), 0, Some(1_000), 999_999);
         assert!(label.contains("1 msg "), "expected singular 'msg': {label}");
         assert!(!label.contains("msgs"));
     }
@@ -3306,10 +3477,76 @@ mod tests {
     fn segment_label_falls_back_to_now_when_end_is_open() {
         // An open-ended segment (`end_ms: None`) measures against the live
         // render-time clock (`now_ms`), not a baked-in end.
-        let label = segment_label(3, 0, None, 5_000);
+        let label = segment_label(3, TokenTally::default(), 0, None, 5_000);
         assert!(
             label.contains("5s"),
             "expected elapsed against now_ms: {label}"
+        );
+    }
+
+    #[test]
+    fn segment_count_label_prefers_tokens_over_messages() {
+        assert_eq!(segment_count_label(3, TokenTally::default()), "3 msgs");
+        assert_eq!(segment_count_label(1, TokenTally::default()), "1 msg");
+        assert_eq!(
+            segment_count_label(
+                3,
+                TokenTally {
+                    input: 1_200,
+                    output: 300,
+                    cached: 0
+                }
+            ),
+            "1.5k tok"
+        );
+    }
+
+    #[test]
+    fn format_token_count_scales_units() {
+        assert_eq!(format_token_count(950), "950");
+        assert_eq!(format_token_count(1_500), "1.5k");
+        assert_eq!(format_token_count(42_000), "42k");
+        assert_eq!(format_token_count(1_300_000), "1.3M");
+        assert_eq!(format_token_count(12_000_000), "12M");
+    }
+
+    #[test]
+    fn segment_tooltip_label_splits_omits_and_totals() {
+        // Full split with cache detail.
+        assert_eq!(
+            segment_tooltip_label(
+                5,
+                &TokenTally {
+                    input: 118_200,
+                    output: 1_800,
+                    cached: 96_400
+                }
+            ),
+            " 5 msgs \u{00b7} in 118k \u{00b7} out 1.8k \u{00b7} cached 96k "
+        );
+        // No cache reads → the cached part is omitted.
+        assert_eq!(
+            segment_tooltip_label(
+                1,
+                &TokenTally {
+                    input: 800,
+                    output: 200,
+                    cached: 0
+                }
+            ),
+            " 1 msg \u{00b7} in 800 \u{00b7} out 200 "
+        );
+        // Unsplit total (codex reports one figure): no fabricated split.
+        assert_eq!(
+            segment_tooltip_label(
+                3,
+                &TokenTally {
+                    input: 2_300,
+                    output: 0,
+                    cached: 0
+                }
+            ),
+            " 3 msgs \u{00b7} 2.3k tok total "
         );
     }
 

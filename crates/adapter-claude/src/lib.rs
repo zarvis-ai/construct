@@ -371,6 +371,9 @@ fn spawn_interactive_transcript_watcher(
         let mut child_seq: HashMap<String, u64> = HashMap::new();
         let mut child_states: HashMap<String, SessionState> = HashMap::new();
         let mut child_parents: HashMap<String, String> = HashMap::new();
+        // Usage dedupe state (`claude_cost_from_assistant`), root + per-child.
+        let mut root_usage_msg_id: Option<String> = None;
+        let mut child_usage_msg_ids: HashMap<String, Option<String>> = HashMap::new();
         let mut last_snapshot: Option<Vec<String>> = None;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -405,10 +408,17 @@ fn spawn_interactive_transcript_watcher(
                     child_seq.clear();
                     child_states.clear();
                     child_parents.clear();
+                    root_usage_msg_id = None;
+                    child_usage_msg_ids.clear();
                 }
             }
-            let root_values =
-                emit_new_claude_transcript_lines(&path, &mut next_line, &emit, &mut last_model);
+            let root_values = emit_new_claude_transcript_lines(
+                &path,
+                &mut next_line,
+                &emit,
+                &mut last_model,
+                &mut root_usage_msg_id,
+            );
             for value in root_values {
                 if let Some((id, state, title)) = claude_native_subagent_update(&value) {
                     child_states.insert(id.clone(), state);
@@ -488,7 +498,10 @@ fn spawn_interactive_transcript_watcher(
                             emit.emit(SessionEvent::NativeSubagentRemoved { id: nested_id });
                         }
                     }
-                    for event in claude_events_from_json(&value) {
+                    for event in claude_events_from_json(
+                        &value,
+                        child_usage_msg_ids.entry(native_id.clone()).or_default(),
+                    ) {
                         let ord = child_seq.entry(native_id.clone()).or_insert(0);
                         emit.emit(SessionEvent::NativeSubagent {
                             id: native_id.clone(),
@@ -552,6 +565,7 @@ fn emit_new_claude_transcript_lines(
     next_line: &mut usize,
     emit: &EventEmitter,
     last_model: &mut Option<String>,
+    last_usage_msg_id: &mut Option<String>,
 ) -> Vec<Value> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -572,7 +586,7 @@ fn emit_new_claude_transcript_lines(
                     *last_model = Some(model.clone());
                     emit.emit(SessionEvent::ModelChanged { model });
                 }
-                emit_event_from_json(emit, v.clone());
+                emit_event_from_json(emit, v.clone(), last_usage_msg_id);
                 values.push(v);
             }
             Err(e) => emit.log(format!(
@@ -900,6 +914,7 @@ where
 {
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
+        let mut last_usage_msg_id: Option<String> = None;
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
                 continue;
@@ -911,7 +926,7 @@ where
                         // Keep the most recently observed id (not only the first).
                         *g = Some(sid.to_string());
                     }
-                    emit_event_from_json(&emit, v);
+                    emit_event_from_json(&emit, v, &mut last_usage_msg_id);
                 }
                 Err(_) => emit.emit(SessionEvent::Message {
                     role: MessageRole::Assistant,
@@ -922,11 +937,11 @@ where
     })
 }
 
-fn emit_event_from_json(emit: &EventEmitter, v: Value) {
+fn emit_event_from_json(emit: &EventEmitter, v: Value, last_usage_msg_id: &mut Option<String>) {
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
         "assistant" | "user" | "result" => {
-            for event in claude_events_from_json(&v) {
+            for event in claude_events_from_json(&v, last_usage_msg_id) {
                 emit.emit(event);
             }
         }
@@ -951,10 +966,13 @@ fn emit_event_from_json(emit: &EventEmitter, v: Value) {
     }
 }
 
-fn claude_events_from_json(v: &Value) -> Vec<SessionEvent> {
+fn claude_events_from_json(v: &Value, last_usage_msg_id: &mut Option<String>) -> Vec<SessionEvent> {
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "assistant" => {
             let mut out = Vec::new();
+            if let Some(cost) = claude_cost_from_assistant(v, last_usage_msg_id) {
+                out.push(cost);
+            }
             let text = extract_message_text(v.get("message"));
             if !text.is_empty() {
                 out.push(SessionEvent::Message {
@@ -971,31 +989,20 @@ fn claude_events_from_json(v: &Value) -> Vec<SessionEvent> {
             tool_results_from_message(v.get("message"))
         }
         "result" => {
+            // Dollar cost only: token usage is already reported per API call
+            // from the assistant records' `message.usage` (spec 0103), and
+            // the run-level `result` aggregates those same calls — emitting
+            // both would double-count.
             let usd = v
                 .get("total_cost_usd")
                 .and_then(|n| n.as_f64())
                 .unwrap_or(0.0);
-            let tin = v
-                .get("usage")
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            let tout = v
-                .get("usage")
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            let tcached = v
-                .get("usage")
-                .and_then(|u| u.get("cache_read_input_tokens"))
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            if usd > 0.0 || tin > 0 || tout > 0 {
+            if usd > 0.0 {
                 vec![SessionEvent::Cost {
                     usd,
-                    tokens_in: tin,
-                    tokens_out: tout,
-                    tokens_cached: tcached,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    tokens_cached: 0,
                 }]
             } else {
                 Vec::new()
@@ -1004,6 +1011,39 @@ fn claude_events_from_json(v: &Value) -> Vec<SessionEvent> {
         }
         _ => Vec::new(),
     }
+}
+
+/// Token usage from an assistant record's `message.usage` (spec 0103).
+/// Both the native session transcript and `-p` stream-json carry it. One
+/// API message can span several transcript records (one per content
+/// block), each repeating the same `message.id` and usage — dedupe on the
+/// id so a message's usage is reported exactly once. `tokens_in` is the
+/// full prompt side (fresh input + cache creation + cache reads), keeping
+/// `tokens_cached ⊆ tokens_in` per the `Cost` event's contract.
+fn claude_cost_from_assistant(v: &Value, last_usage_msg_id: &mut Option<String>) -> Option<SessionEvent> {
+    let msg = v.get("message")?;
+    let usage = msg.get("usage")?;
+    let id = msg.get("id").and_then(|i| i.as_str())?;
+    if last_usage_msg_id.as_deref() == Some(id) {
+        return None;
+    }
+    let field = |k: &str| usage.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+    let input = field("input_tokens");
+    let output = field("output_tokens");
+    let cache_read = field("cache_read_input_tokens");
+    let cache_creation = field("cache_creation_input_tokens");
+    if input == 0 && output == 0 && cache_read == 0 && cache_creation == 0 {
+        return None;
+    }
+    *last_usage_msg_id = Some(id.to_string());
+    Some(SessionEvent::Cost {
+        usd: 0.0,
+        tokens_in: input
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation),
+        tokens_out: output,
+        tokens_cached: cache_read,
+    })
 }
 
 fn extract_message_text(msg: Option<&Value>) -> String {
@@ -1304,7 +1344,7 @@ mod tests {
             }
         });
 
-        let events = claude_events_from_json(&v);
+        let events = claude_events_from_json(&v, &mut None);
         assert_eq!(events.len(), 2);
         match &events[0] {
             SessionEvent::Message { role, text } => {
@@ -1344,7 +1384,7 @@ mod tests {
             }
         });
 
-        match claude_events_from_json(&v).as_slice() {
+        match claude_events_from_json(&v, &mut None).as_slice() {
             [SessionEvent::ToolResult {
                 tool,
                 ok,
@@ -1361,7 +1401,10 @@ mod tests {
     }
 
     #[test]
-    fn result_record_emits_cost_without_duplicate_message() {
+    fn result_record_emits_usd_only_cost_without_duplicate_message() {
+        // Token usage comes from the assistant records (deduped by message
+        // id); the run-level `result` aggregates the same calls, so it only
+        // contributes the dollar figure (spec 0103).
         let v = serde_json::json!({
             "type": "result",
             "result": "final text that should not become another message",
@@ -1372,19 +1415,98 @@ mod tests {
             }
         });
 
-        match claude_events_from_json(&v).as_slice() {
+        match claude_events_from_json(&v, &mut None).as_slice() {
             [SessionEvent::Cost {
                 usd,
                 tokens_in,
                 tokens_out,
-                ..
+                tokens_cached,
             }] => {
                 assert_eq!(*usd, 0.25);
-                assert_eq!(*tokens_in, 10);
-                assert_eq!(*tokens_out, 20);
+                assert_eq!(*tokens_in, 0);
+                assert_eq!(*tokens_out, 0);
+                assert_eq!(*tokens_cached, 0);
             }
             other => panic!("unexpected cost events: {other:?}"),
         }
+    }
+
+    #[test]
+    fn assistant_usage_emits_cost_once_per_message_id() {
+        // One API message split across two transcript records (text block,
+        // then tool_use block), both repeating the same `message.id` and
+        // usage — exactly one Cost event, with the full prompt side in
+        // `tokens_in` and cache reads broken out in `tokens_cached`.
+        let record = |content: serde_json::Value| {
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "id": "msg_01",
+                    "role": "assistant",
+                    "content": [content],
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 20,
+                        "cache_read_input_tokens": 100,
+                        "cache_creation_input_tokens": 30
+                    }
+                }
+            })
+        };
+        let mut last_id = None;
+        let first = claude_events_from_json(
+            &record(serde_json::json!({ "type": "text", "text": "hi" })),
+            &mut last_id,
+        );
+        match first.first() {
+            Some(SessionEvent::Cost {
+                usd,
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+            }) => {
+                assert_eq!(*usd, 0.0);
+                assert_eq!(*tokens_in, 137); // 7 fresh + 100 cache read + 30 cache creation
+                assert_eq!(*tokens_out, 20);
+                assert_eq!(*tokens_cached, 100);
+            }
+            other => panic!("expected a leading Cost event, got {other:?}"),
+        }
+        let second = claude_events_from_json(
+            &record(serde_json::json!({
+                "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}
+            })),
+            &mut last_id,
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Cost { .. })),
+            "same message id must not report usage twice: {second:?}"
+        );
+
+        // A NEW message id reports again.
+        let mut third_record = record(serde_json::json!({ "type": "text", "text": "next" }));
+        third_record["message"]["id"] = serde_json::json!("msg_02");
+        let third = claude_events_from_json(&third_record, &mut last_id);
+        assert!(
+            third
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Cost { .. })),
+            "a new message id must report its usage: {third:?}"
+        );
+    }
+
+    #[test]
+    fn assistant_without_usage_or_id_emits_no_cost() {
+        // Records lacking usage (or an id to dedupe on) contribute nothing.
+        let v = serde_json::json!({
+            "type": "assistant",
+            "message": { "role": "assistant", "content": [{ "type": "text", "text": "hi" }] }
+        });
+        assert!(!claude_events_from_json(&v, &mut None)
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Cost { .. })));
     }
 
     #[test]

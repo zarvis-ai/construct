@@ -98,6 +98,7 @@ impl SessionManager {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             merge: None,
         };
         self.storage.save_summary(&summary)?;

@@ -2486,6 +2486,7 @@ mod search_tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: ApprovalMode::Manual,
             kind: SessionKind::User,
             archived: false,

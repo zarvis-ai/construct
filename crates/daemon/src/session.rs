@@ -1445,16 +1445,17 @@ impl SessionManager {
             // (called from main after construction) tries to respawn each
             // resumable session and falls back to marking Errored on failure.
             // Recover seq counter from transcript line count, and recount
-            // chat messages while we're at it — `message_count` then
-            // self-heals for summaries saved before the field existed (or
-            // that lagged a crash).
+            // chat messages and token tallies while we're at it —
+            // `message_count`/`tokens` then self-heal for summaries saved
+            // before the fields existed (or that lagged a crash).
             let path = storage.transcript_path(&s.id);
-            let (count, message_count) = if path.exists() {
+            let (count, message_count, tokens) = if path.exists() {
                 let f = std::fs::File::open(&path)?;
                 let reader = std::io::BufReader::new(f);
                 use std::io::BufRead;
                 let mut n = 0u64;
                 let mut msgs = 0u64;
+                let mut tally = construct_protocol::TokenTally::default();
                 for line in reader.lines() {
                     let line = line?;
                     if line.trim().is_empty() {
@@ -1464,17 +1465,25 @@ impl SessionManager {
                     if let Ok(ts) =
                         serde_json::from_str::<construct_protocol::TimestampedEvent>(&line)
                     {
-                        if matches!(ts.event, SessionEvent::Message { .. }) {
-                            msgs += 1;
+                        match ts.event {
+                            SessionEvent::Message { .. } => msgs += 1,
+                            SessionEvent::Cost {
+                                tokens_in,
+                                tokens_out,
+                                tokens_cached,
+                                ..
+                            } => tally.add(tokens_in, tokens_out, tokens_cached),
+                            _ => {}
                         }
                     }
                 }
-                (n, msgs)
+                (n, msgs, tally)
             } else {
-                (0, 0)
+                (0, 0, construct_protocol::TokenTally::default())
             };
             let mut s = s;
             s.message_count = message_count;
+            s.tokens = tokens;
             // Scrollback survives daemon restarts because `pty_replay`
             // serves it from the on-disk `pty.log` directly; no in-memory
             // rehydration needed.
@@ -2807,7 +2816,7 @@ impl SessionManager {
             .map(str::trim)
             .filter(|c| !c.is_empty());
 
-        let (owner_cwd, owner_harness, owner_group_id, owner_busy_ms, owner_message_count) = {
+        let (owner_cwd, owner_harness, owner_group_id, owner_busy_ms, owner_message_count, owner_tokens) = {
             let summary = entry.summary.read().await;
             let now_ms = Utc::now().timestamp_millis();
             (
@@ -2816,6 +2825,7 @@ impl SessionManager {
                 summary.group_id.clone(),
                 summary.busy_ms_at(now_ms),
                 summary.message_count,
+                summary.tokens,
             )
         };
         // Fork, not a fresh child (spec 0089): when the owning session's
@@ -2885,6 +2895,7 @@ impl SessionManager {
                     at_ms: Utc::now().timestamp_millis(),
                     parent_busy_ms: owner_busy_ms,
                     parent_message_count: owner_message_count,
+                    parent_tokens: owner_tokens,
                     is_reset_snapshot: false,
                 }),
             })
@@ -3842,13 +3853,18 @@ impl SessionManager {
         // has since been deleted has no timeline left to mark; fall back to
         // 0 rather than failing the merge over it.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let (merged_seq, merged_busy_ms, merged_message_count) =
+        let (merged_seq, merged_busy_ms, merged_message_count, merged_tokens) =
             match self.get_entry(&parent_id).await {
                 Some(parent) => {
                     let p = parent.summary().await;
-                    (p.event_count, p.busy_ms_at(now_ms), p.message_count)
+                    (
+                        p.event_count,
+                        p.busy_ms_at(now_ms),
+                        p.message_count,
+                        p.tokens,
+                    )
                 }
-                None => (0, 0, 0),
+                None => (0, 0, 0, construct_protocol::TokenTally::default()),
             };
         let snapshot = {
             let mut summary = entry.summary.write().await;
@@ -3858,6 +3874,7 @@ impl SessionManager {
                 merged_seq,
                 merged_busy_ms,
                 merged_message_count,
+                merged_tokens,
             });
             summary.clone()
         };
@@ -4425,6 +4442,7 @@ impl SessionManager {
             event_count,
             busy_ms,
             message_count,
+            tokens,
             has_pty,
             mode,
         ) = {
@@ -4438,6 +4456,7 @@ impl SessionManager {
                 s.event_count,
                 s.busy_ms_at(now_ms),
                 s.message_count,
+                s.tokens,
                 // A fork of this snapshot should spawn the same way a fork
                 // of the live session would (interactive PTY vs headless) —
                 // carried from the live session at the moment of reset, not
@@ -4480,6 +4499,7 @@ impl SessionManager {
             busy_ms,
             busy_running_since_ms: None,
             message_count,
+            tokens,
             approval_mode,
             kind: construct_protocol::SessionKind::User,
             archived: true,
@@ -4491,6 +4511,7 @@ impl SessionManager {
                 at_ms: now_ms,
                 parent_busy_ms: busy_ms,
                 parent_message_count: message_count,
+                parent_tokens: tokens,
                 is_reset_snapshot: true,
             }),
             merge: None,
@@ -5099,6 +5120,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
@@ -5591,6 +5613,7 @@ mod tests {
                 busy_ms: 0,
                 busy_running_since_ms: None,
                 message_count: 0,
+                tokens: Default::default(),
                 approval_mode: construct_protocol::ApprovalMode::Manual,
                 kind,
                 archived: false,
@@ -5651,6 +5674,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         entry
@@ -6579,6 +6603,11 @@ mod tests {
             s.event_count = 17;
             s.busy_ms = 7_500;
             s.message_count = 6;
+            s.tokens = construct_protocol::TokenTally {
+                input: 12_000,
+                output: 800,
+                cached: 9_000,
+            };
         }
         mgr.sessions.write().await.insert("parent".into(), parent);
 
@@ -6589,6 +6618,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         fork.summary.write().await.event_count = 2;
@@ -6619,6 +6649,16 @@ mod tests {
             merge.merged_message_count, 6,
             "the merge boundary snapshots the PARENT's chat-message tally \
              so lineage turn-info windows can count actual messages"
+        );
+        assert_eq!(
+            merge.merged_tokens,
+            construct_protocol::TokenTally {
+                input: 12_000,
+                output: 800,
+                cached: 9_000,
+            },
+            "the merge boundary snapshots the PARENT's token tally so lineage \
+             turn-info windows can label token deltas (spec 0103)"
         );
 
         // The parent's own event_count is untouched by merge() itself — the
@@ -6657,6 +6697,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         mgr.sessions
@@ -7489,6 +7530,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: construct_protocol::SessionKind::User,
             forked_from: None,
@@ -7632,6 +7674,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: construct_protocol::SessionKind::User,
             archived: false,

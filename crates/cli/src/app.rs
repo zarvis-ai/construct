@@ -3346,6 +3346,11 @@ pub struct LayoutSnapshot {
     /// The "▸/▾ N subagents" group-toggle rows — click toggles that
     /// parent's group between collapsed and expanded.
     pub lineage_subagent_toggle_hits: Vec<LineageBoxHit>,
+    /// Hovered turn-info line's token-detail tooltip (spec 0103): the
+    /// segment text's on-screen rect (the anchor) and the prebuilt label.
+    /// Set during the lineage section's hit walk; consumed by the frame's
+    /// tooltip pass. `None` when nothing token-bearing is hovered.
+    pub lineage_segment_tooltip: Option<(ratatui::layout::Rect, String)>,
     /// Program title-bar Run button bounds: `(x_start, x_end, y)`.
     pub program_title_run_hit: Option<(u16, u16, u16)>,
     /// Program title-bar mode toggle bounds: `(x_start, x_end, y)`.
@@ -13285,6 +13290,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: true,
         });
         assert_eq!(natural_view_mode(&snapshot), ViewMode::Chat);
@@ -13300,6 +13306,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         assert_eq!(natural_view_mode(&ordinary_fork), ViewMode::Terminal);
@@ -13570,6 +13577,7 @@ mod tests {
             lineage_hscrollbar: None,
             lineage_box_hits: Vec::new(),
             lineage_subagent_toggle_hits: Vec::new(),
+            lineage_segment_tooltip: None,
             program_title_run_hit: None,
             program_title_toggle_hit: None,
             program_title_close_hit: None,
@@ -13942,6 +13950,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
+            tokens: Default::default(),
             approval_mode: construct_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
@@ -14355,6 +14364,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         app.sessions = vec![root, fork];
@@ -14575,6 +14585,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
 
@@ -27944,6 +27955,7 @@ mod tests {
             parent_busy_ms: 0,
             at_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         app.sessions.push(second);
@@ -33996,6 +34008,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         let mut app = test_app(client, vec![root, fork]);
@@ -34017,6 +34030,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         app.sessions.extend([other_root, other_fork]);
@@ -34334,6 +34348,7 @@ mod tests {
                 at_ms: 0,
                 parent_busy_ms: 0,
                 parent_message_count: 0,
+                parent_tokens: Default::default(),
                 is_reset_snapshot: false,
             });
             app.sessions.push(fork);
@@ -35121,6 +35136,7 @@ mod tests {
                 at_ms: 0,
                 parent_busy_ms: 0,
                 parent_message_count: 0,
+                parent_tokens: Default::default(),
                 is_reset_snapshot: false,
             });
             parent = nested.id.clone();
@@ -35157,6 +35173,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
         app.sessions.push(nested);
@@ -35198,6 +35215,7 @@ mod tests {
                 at_ms: 0,
                 merged_busy_ms: 0,
                 merged_message_count: 0,
+                merged_tokens: Default::default(),
                 merged_seq: 0,
             });
         }
@@ -35254,6 +35272,7 @@ mod tests {
                 at_ms: 0,
                 merged_busy_ms: 0,
                 merged_message_count: 0,
+                merged_tokens: Default::default(),
                 merged_seq: 0,
             });
         }
@@ -35311,6 +35330,7 @@ mod tests {
                 at_ms: 0,
                 merged_busy_ms: 0,
                 merged_message_count: 0,
+                merged_tokens: Default::default(),
                 merged_seq: 0,
             });
         }
@@ -35686,6 +35706,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
 
@@ -35742,6 +35763,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
 
@@ -35797,6 +35819,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
 
@@ -36176,6 +36199,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            parent_tokens: Default::default(),
             is_reset_snapshot: false,
         });
 
