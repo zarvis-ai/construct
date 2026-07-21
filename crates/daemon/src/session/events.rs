@@ -377,9 +377,17 @@ impl SessionManager {
         }
         // Update summary based on event semantics.
         let is_focused = self.focused_sessions.lock().unwrap().contains(&entry.id);
+        let settling = entry.resume_settling_since_ms.load(Ordering::Relaxed) > 0;
         // Genuine activity in an unfocused session is what makes a later stop
         // "need you" — record it so the marker logic below can require it.
-        if !is_focused && event_is_unseen_activity(&event) {
+        // A terminal event during the post-respawn settle window is the
+        // resume attempt itself ending, not new work from the session. In
+        // particular, a stale native Grok id exits immediately with
+        // `Done { exit_code: 1 }`; treating that as unseen activity would
+        // manufacture an attention dot on every daemon restart. See spec 0054.
+        let terminal_resume_event =
+            settling && matches!(&event, SessionEvent::Done { .. } | SessionEvent::Error { .. });
+        if !is_focused && !terminal_resume_event && event_is_unseen_activity(&event) {
             entry.unseen_activity.store(true, Ordering::Relaxed);
         }
         {

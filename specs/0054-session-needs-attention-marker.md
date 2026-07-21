@@ -58,7 +58,11 @@ on you."
   output that is byte-wise indistinguishable from a real turn and therefore
   defeats the blip filter. During a bounded settle window after such a
   respawn, PTY output neither counts as unseen activity nor undoes a
-  quiescence-driven idle. The window ends once the repaint has gone quiet
+  quiescence-driven idle. A terminal `Done` or `Error` event emitted by the
+  resume attempt during that window also does not count as unseen activity;
+  for example, a harness discovering that its persisted native session no
+  longer exists must not manufacture a dot. The window ends once the repaint
+  has gone quiet
   (never before a minimum long enough to also cover the daemon's delayed
   forced redraw, and always by a hard cap so a child genuinely streaming
   through the resume regains normal tracking). Without this rule, every
@@ -116,11 +120,13 @@ daemon, which already tracks last-output time.
   marker signals a stop after work, not passive notices.
 - The resume settle window trades a rare miss for restart silence: a session
   that was genuinely mid-turn at shutdown and finishes within the window
-  after the respawn does not flag on that stop. Accepted — old-content
-  repaints and truly-continuing streams are indistinguishable byte-wise, the
-  repaint case dominates by orders of magnitude, and the miss self-heals on
-  the session's next real turn. A session still streaming past the window's
-  hard cap flags normally when it eventually stops.
+  after the respawn, or whose resume attempt fails within the window, does not
+  flag on that stop. Accepted — old-content repaints, resume failures, and
+  truly-continuing streams are indistinguishable as restart-driven versus
+  session-driven activity at that point, the repaint case dominates by orders
+  of magnitude, and the miss self-heals on the session's next real turn. A
+  session still streaming past the window's hard cap flags normally when it
+  eventually stops.
 - The "focused session" used to suppress the marker is global to the daemon
   (last switch wins). With multiple simultaneous viewers this is approximate;
   single-operator use is exact. Don't build per-viewer marker state on top of

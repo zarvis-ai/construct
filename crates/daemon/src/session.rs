@@ -8275,6 +8275,76 @@ mod tests {
         );
     }
 
+    /// Regression: a resumed Grok session whose persisted native session no
+    /// longer exists exits immediately with `Done { exit_code: 1 }`. That
+    /// terminal event belongs to the daemon's resume attempt, not to new work,
+    /// so it must not manufacture a needs-attention marker during settling.
+    /// Spec 0054.
+    #[tokio::test]
+    async fn marker_ignores_terminal_resume_failure() {
+        use tempfile::tempdir;
+        use tokio::sync::RwLock;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+        let manager = Arc::new(mgr);
+
+        let mut summary = placement_summary(
+            "missing-native-grok",
+            0,
+            None,
+            construct_protocol::SessionKind::User,
+        );
+        summary.harness = "grok".into();
+        summary.has_pty = true;
+        summary.state = SessionState::Running;
+        let entry = Arc::new(SessionEntry {
+            id: summary.id.clone(),
+            summary: RwLock::new(summary),
+            transcript_count: AtomicU64::new(0),
+            adapter: tokio::sync::Mutex::new(None),
+            pty: tokio::sync::Mutex::new(PtyState::default()),
+            deleted: AtomicBool::new(false),
+            archived: AtomicBool::new(false),
+            title_gen_attempted: AtomicBool::new(false),
+            pending_title_prompts: std::sync::Mutex::new(Vec::new()),
+            pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+            pty_input_queue: std::sync::Mutex::new(None),
+            tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+            pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+            unseen_activity: AtomicBool::new(false),
+            pty_burst_start_ms: AtomicI64::new(0),
+            resume_settling_since_ms: AtomicI64::new(Utc::now().timestamp_millis()),
+            osc11_tail: std::sync::Mutex::new(Vec::new()),
+        });
+        manager
+            .sessions
+            .write()
+            .await
+            .insert(entry.id.clone(), entry.clone());
+
+        manager
+            .handle_event(&entry, SessionEvent::Done { exit_code: 1 })
+            .await;
+
+        let result = entry.summary.read().await;
+        assert_eq!(result.state, SessionState::Errored);
+        assert!(
+            !entry.unseen_activity.load(Ordering::Relaxed),
+            "the resume attempt's terminal event is not unseen session work",
+        );
+        assert!(
+            !result.needs_attention,
+            "a terminal failure during resume settling must not raise the dot",
+        );
+    }
+
     /// The `needs_attention` marker tracks "this session needs you": raised when
     /// a session with unseen activity leaves `Running` while unfocused, cleared
     /// by `mark_seen` or a return to `Running`, suppressed for the focused
