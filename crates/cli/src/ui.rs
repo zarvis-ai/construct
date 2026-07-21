@@ -7803,12 +7803,14 @@ fn modeline_context_usage_text(
     let used = used?;
     let window = window.filter(|window| *window > 0)?;
     let text = format!(
-        " {}/{} {}%",
+        "  {}/{} {}% ",
         crate::lineage::format_token_count(used),
         crate::lineage::format_token_count(window),
         used.saturating_mul(100) / window,
     );
-    let text_cells = UnicodeWidthStr::width(text.trim_start());
+    // The first space separates the gauge from the model name. The next and
+    // final spaces are padding within the bar itself.
+    let text_cells = UnicodeWidthStr::width(&text[1..]);
     let filled_cells = (text_cells * used.min(window) as usize).div_ceil(window as usize);
     Some((text, filled_cells))
 }
@@ -18606,7 +18608,7 @@ mod tests {
     fn modeline_context_usage_shows_full_token_text_over_a_bar() {
         assert_eq!(
             modeline_context_usage_text(Some(12_400), Some(258_400)),
-            Some((" 12k/258k 4%".to_string(), 1))
+            Some(("  12k/258k 4% ".to_string(), 1))
         );
         assert_eq!(modeline_context_usage_text(Some(74_200), None), None);
         assert_eq!(modeline_context_usage_text(Some(500), Some(0)), None);
