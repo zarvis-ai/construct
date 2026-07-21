@@ -212,6 +212,40 @@ fn wire_effort_change(v: &Value, last_effort: &Option<String>) -> Option<String>
     (last_effort.as_deref() != Some(effort)).then(|| effort.to_string())
 }
 
+/// Token usage from a `context.append_loop_event`/`step.end` wire line
+/// (spec 0103). Kimi stamps one per LLM call:
+/// `{"usage":{"inputOther","output","inputCacheRead","inputCacheCreation"}}`.
+/// `tokens_in` covers the full prompt side (other + cache reads + cache
+/// creation), keeping `tokens_cached ⊆ tokens_in` per the Cost contract.
+/// No dedupe needed — each step lands exactly once and the watcher's line
+/// cursor already skips history on resume.
+fn wire_usage_cost(v: &Value) -> Option<SessionEvent> {
+    if v.get("type").and_then(|t| t.as_str()) != Some("context.append_loop_event") {
+        return None;
+    }
+    let event = v.get("event")?;
+    if event.get("type").and_then(|t| t.as_str()) != Some("step.end") {
+        return None;
+    }
+    let usage = event.get("usage")?;
+    let field = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let other = field("inputOther");
+    let output = field("output");
+    let cache_read = field("inputCacheRead");
+    let cache_creation = field("inputCacheCreation");
+    if other == 0 && output == 0 && cache_read == 0 && cache_creation == 0 {
+        return None;
+    }
+    Some(SessionEvent::Cost {
+        usd: 0.0,
+        tokens_in: other
+            .saturating_add(cache_read)
+            .saturating_add(cache_creation),
+        tokens_out: output,
+        tokens_cached: cache_read,
+    })
+}
+
 fn append_launch_args(args: &mut Vec<String>, model: Option<&str>, native_id: Option<&str>) {
     if let Some(model) = model {
         args.extend(["--model".into(), model.into()]);
@@ -370,6 +404,9 @@ fn spawn_session_watcher(setup: WatcherSetup, emit: EventEmitter) {
                 if let Some(effort) = wire_effort_change(&v, &last_effort) {
                     last_effort = Some(effort.clone());
                     emit.emit(SessionEvent::EffortChanged { effort });
+                }
+                if let Some(cost) = wire_usage_cost(&v) {
+                    emit.emit(cost);
                 }
             }
             wire_cursor = text.lines().count();
@@ -540,6 +577,44 @@ mod tests {
 
         let other = serde_json::json!({"type": "metadata", "modelAlias": "x"});
         assert_eq!(wire_model_change(&other, &None), None);
+    }
+
+    #[test]
+    fn step_end_usage_emits_cost_with_full_prompt_side() {
+        // Real wire.jsonl shape: one usage per LLM step. `tokens_in` must
+        // cover other + cache reads + cache creation, with the reads
+        // broken out in `tokens_cached`.
+        let v = serde_json::json!({
+            "type": "context.append_loop_event",
+            "event": {
+                "type": "step.end",
+                "usage": {
+                    "inputOther": 1029,
+                    "output": 196,
+                    "inputCacheRead": 68_864,
+                    "inputCacheCreation": 512
+                }
+            }
+        });
+        match wire_usage_cost(&v) {
+            Some(SessionEvent::Cost {
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                ..
+            }) => {
+                assert_eq!(tokens_in, 1029 + 68_864 + 512);
+                assert_eq!(tokens_out, 196);
+                assert_eq!(tokens_cached, 68_864);
+            }
+            other => panic!("expected a Cost event: {other:?}"),
+        }
+        // Non-step lines and steps without usage contribute nothing.
+        let other = serde_json::json!({
+            "type": "context.append_loop_event",
+            "event": { "type": "step.begin" }
+        });
+        assert!(wire_usage_cost(&other).is_none());
     }
 
     #[test]

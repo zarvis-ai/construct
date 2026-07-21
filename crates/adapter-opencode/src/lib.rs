@@ -21,22 +21,30 @@ use std::path::{Path, PathBuf};
 
 const SESSION_ID_FILE: &str = "opencode_session_id.txt";
 const MODEL_FILE: &str = "opencode_model.txt";
+const USAGE_FILE: &str = "opencode_usage.json";
 const PLUGIN_FILE: &str = "construct-opencode-session.js";
 
 /// OpenCode keeps its conversations in a database shared by every OpenCode
-/// process, so both the active session id and the model it answers with have
-/// to be observed from inside our own process. The plugin records the session
-/// id on creation and, for every assistant reply on that session, the
-/// `provider/model` pair OpenCode actually used — the same form OpenCode's
-/// own model flag takes, so a resumed session can be put back on it.
+/// process, so the active session id, the model it answers with, and its
+/// token consumption all have to be observed from inside our own process.
+/// The plugin records the session id on creation and, for every assistant
+/// reply on that session, the `provider/model` pair OpenCode actually used —
+/// the same form OpenCode's own model flag takes, so a resumed session can
+/// be put back on it — plus a cumulative token tally (spec 0103): each
+/// COMPLETED assistant message's tokens are added once (deduped by message
+/// id — `message.updated` fires repeatedly while a reply streams) and the
+/// running totals written as one JSON object the adapter polls for deltas.
 /// Assistant replies from child sessions (OpenCode's own subagents) carry a
-/// different session id and are ignored, so a subagent's model never
-/// overwrites the conversation's.
+/// different session id and are ignored, so a subagent's model/usage never
+/// bleeds into the conversation's.
 const SESSION_PLUGIN: &str = r#"export const ConstructSession = async () => {
   const sessionFile = process.env.CONSTRUCT_OPENCODE_SESSION_FILE
   const modelFile = process.env.CONSTRUCT_OPENCODE_MODEL_FILE
+  const usageFile = process.env.CONSTRUCT_OPENCODE_USAGE_FILE
   const forkFrom = process.env.CONSTRUCT_OPENCODE_FORK_FROM
   let rootId = null
+  const usageTotals = { input: 0, output: 0, cached: 0 }
+  const usageSeen = new Set()
   const root = async () => {
     if (!rootId && sessionFile) {
       const recorded = await Bun.file(sessionFile).text().catch(() => "")
@@ -54,10 +62,20 @@ const SESSION_PLUGIN: &str = r#"export const ConstructSession = async () => {
         return
       }
       if (event.type === "message.updated") {
-        if (!modelFile || info?.role !== "assistant") return
-        if (!info.providerID || !info.modelID) return
+        if (info?.role !== "assistant") return
         if (info.sessionID !== (await root())) return
-        await Bun.write(modelFile, info.providerID + "/" + info.modelID + "\n")
+        if (modelFile && info.providerID && info.modelID) {
+          await Bun.write(modelFile, info.providerID + "/" + info.modelID + "\n")
+        }
+        const t = info.tokens
+        if (usageFile && t && info.time?.completed && info.id && !usageSeen.has(info.id)) {
+          usageSeen.add(info.id)
+          const cache = t.cache || {}
+          usageTotals.input += (t.input || 0) + (cache.read || 0) + (cache.write || 0)
+          usageTotals.output += (t.output || 0) + (t.reasoning || 0)
+          usageTotals.cached += cache.read || 0
+          await Bun.write(usageFile, JSON.stringify(usageTotals) + "\n")
+        }
       }
     },
   }
@@ -136,6 +154,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         match install_session_integration(dir, inherited_config.as_ref(), mcp) {
             Ok(config) => {
                 let model_file = dir.join(MODEL_FILE);
+                let usage_file = dir.join(USAGE_FILE);
                 env.retain(|(key, _)| key != "OPENCODE_CONFIG_CONTENT");
                 env.push(("OPENCODE_CONFIG_CONTENT".into(), config));
                 env.push((
@@ -146,8 +165,13 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
                     "CONSTRUCT_OPENCODE_MODEL_FILE".into(),
                     model_file.to_string_lossy().into_owned(),
                 ));
+                env.push((
+                    "CONSTRUCT_OPENCODE_USAGE_FILE".into(),
+                    usage_file.to_string_lossy().into_owned(),
+                ));
                 spawn_native_id_watcher(session_file.to_path_buf(), native_id, ctx.emit.clone());
                 spawn_model_watcher(model_file, params.model.clone(), ctx.emit.clone());
+                spawn_usage_watcher(usage_file, ctx.emit.clone());
             }
             Err(error) => ctx.emit.log(format!(
                 "opencode native-session capture disabled: {error:#}"
@@ -335,6 +359,76 @@ fn spawn_model_watcher(path: PathBuf, requested: Option<String>, emit: EventEmit
     });
 }
 
+/// Cumulative token totals as the plugin writes them (spec 0103):
+/// `{"input":N,"output":N,"cached":N}`, where `input` already covers the
+/// full prompt side (fresh + cache reads + cache writes) and `cached` is
+/// the read subset.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UsageTotals {
+    input: u64,
+    output: u64,
+    cached: u64,
+}
+
+/// Turn the plugin's cumulative usage file into per-poll Cost deltas. The
+/// baseline seeds from whatever the file already holds at spawn, so a
+/// respawn never re-reports history the daemon's transcript already counted
+/// (a stale file from before the restart). A shrinking total means the
+/// plugin restarted and began a fresh count — rebase silently, then report
+/// growth from there.
+fn spawn_usage_watcher(path: PathBuf, emit: EventEmitter) {
+    tokio::spawn(async move {
+        let mut reported = read_usage(&path).unwrap_or_default();
+        let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let Some(observed) = read_usage(&path) else {
+                continue;
+            };
+            if let Some(cost) = usage_delta_cost(&mut reported, observed) {
+                emit.emit(cost);
+            }
+        }
+    });
+}
+
+fn read_usage(path: &Path) -> Option<UsageTotals> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(text.trim()).ok()?;
+    let field = |k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    Some(UsageTotals {
+        input: field("input"),
+        output: field("output"),
+        cached: field("cached"),
+    })
+}
+
+fn usage_delta_cost(reported: &mut UsageTotals, observed: UsageTotals) -> Option<SessionEvent> {
+    if observed.input < reported.input
+        || observed.output < reported.output
+        || observed.cached < reported.cached
+    {
+        // Plugin restart: totals rebased to zero. Adopt the new baseline
+        // without emitting — the drop isn't negative usage.
+        *reported = observed;
+        return None;
+    }
+    let d_in = observed.input - reported.input;
+    let d_out = observed.output - reported.output;
+    let d_cached = observed.cached - reported.cached;
+    if d_in == 0 && d_out == 0 && d_cached == 0 {
+        return None;
+    }
+    *reported = observed;
+    Some(SessionEvent::Cost {
+        usd: 0.0,
+        tokens_in: d_in,
+        tokens_out: d_out,
+        tokens_cached: d_cached,
+    })
+}
+
 fn update_model(current: &mut Option<String>, observed: String) -> bool {
     if current.as_deref() == Some(observed.as_str()) {
         return false;
@@ -370,6 +464,75 @@ fn file_url(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_deltas_emit_once_and_rebase_on_plugin_restart() {
+        let mut reported = UsageTotals::default();
+        let first = UsageTotals {
+            input: 11_000,
+            output: 120,
+            cached: 2_000,
+        };
+        match usage_delta_cost(&mut reported, first) {
+            Some(SessionEvent::Cost {
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                ..
+            }) => {
+                assert_eq!(tokens_in, 11_000);
+                assert_eq!(tokens_out, 120);
+                assert_eq!(tokens_cached, 2_000);
+            }
+            other => panic!("expected a Cost event: {other:?}"),
+        }
+        // Unchanged totals stay quiet; growth reports only the delta.
+        assert!(usage_delta_cost(&mut reported, first).is_none());
+        let second = UsageTotals {
+            input: 15_000,
+            output: 200,
+            cached: 5_000,
+        };
+        match usage_delta_cost(&mut reported, second) {
+            Some(SessionEvent::Cost {
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                ..
+            }) => {
+                assert_eq!(tokens_in, 4_000);
+                assert_eq!(tokens_out, 80);
+                assert_eq!(tokens_cached, 3_000);
+            }
+            other => panic!("expected a delta Cost event: {other:?}"),
+        }
+        // A shrinking total = plugin restarted and rebased to zero: adopt
+        // the new baseline silently, then report growth from there.
+        let rebased = UsageTotals {
+            input: 500,
+            output: 10,
+            cached: 0,
+        };
+        assert!(usage_delta_cost(&mut reported, rebased).is_none());
+        let grown = UsageTotals {
+            input: 900,
+            output: 25,
+            cached: 100,
+        };
+        match usage_delta_cost(&mut reported, grown) {
+            Some(SessionEvent::Cost {
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                ..
+            }) => {
+                assert_eq!(tokens_in, 400);
+                assert_eq!(tokens_out, 15);
+                assert_eq!(tokens_cached, 100);
+            }
+            other => panic!("expected post-rebase delta: {other:?}"),
+        }
+    }
 
     #[test]
     fn native_id_requires_opencode_session_shape() {

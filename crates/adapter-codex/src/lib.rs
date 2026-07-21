@@ -250,6 +250,7 @@ fn spawn_interactive_transcript_watcher(
         let mut next_line: usize = 0;
         let mut last_model = initial_model;
         let mut last_effort: Option<String> = None;
+        let mut reported_usage = UsageTotals::default();
         let mut known: HashMap<String, (PathBuf, SessionMeta)> = HashMap::new();
         let mut child_lines: HashMap<String, usize> = HashMap::new();
         let mut child_seq: HashMap<String, u64> = HashMap::new();
@@ -309,10 +310,16 @@ fn spawn_interactive_transcript_watcher(
                     // Skip existing lines only on the initial attach of a
                     // resumed session. Mid-session rebinds (after /clear)
                     // start at line 0 so chat mode sees the new conversation.
-                    next_line = if first_select && skip_existing {
-                        count_jsonl_lines(&path)
+                    // Usage reporting follows the same split: a resumed
+                    // session's historical usage is already in the daemon's
+                    // tally, so baseline off the file's last snapshot; a
+                    // fresh conversation starts from zero.
+                    if first_select && skip_existing {
+                        next_line = count_jsonl_lines(&path);
+                        reported_usage = last_rollout_usage_totals(&path);
                     } else {
-                        0
+                        next_line = 0;
+                        reported_usage = UsageTotals::default();
                     };
                     if !first_select {
                         emit.log(format!(
@@ -340,6 +347,7 @@ fn spawn_interactive_transcript_watcher(
                 &emit,
                 &mut last_model,
                 &mut last_effort,
+                &mut reported_usage,
             );
 
             let Some(root_id) = selected
@@ -508,6 +516,7 @@ fn emit_new_codex_rollout_lines(
     emit: &EventEmitter,
     last_model: &mut Option<String>,
     last_effort: &mut Option<String>,
+    reported_usage: &mut UsageTotals,
 ) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
@@ -522,7 +531,7 @@ fn emit_new_codex_rollout_lines(
             continue;
         }
         match serde_json::from_str::<Value>(line) {
-            Ok(v) => emit_codex_rollout_event(emit, &v, last_model, last_effort),
+            Ok(v) => emit_codex_rollout_event(emit, &v, last_model, last_effort, reported_usage),
             Err(e) => emit.log(format!(
                 "codex transcript: failed to parse {} line {}: {e}",
                 path.display(),
@@ -538,6 +547,7 @@ fn emit_codex_rollout_event(
     v: &Value,
     last_model: &mut Option<String>,
     last_effort: &mut Option<String>,
+    reported_usage: &mut UsageTotals,
 ) {
     if let Some(model) = codex_model_change(v, last_model) {
         *last_model = Some(model.clone());
@@ -547,9 +557,92 @@ fn emit_codex_rollout_event(
         *last_effort = Some(effort.clone());
         emit.emit(SessionEvent::EffortChanged { effort });
     }
+    if let Some(cost) = codex_usage_cost(v, reported_usage) {
+        emit.emit(cost);
+    }
     for event in codex_rollout_events(v) {
         emit.emit(event);
     }
+}
+
+/// Cumulative token totals already reported for the bound rollout, so each
+/// `token_count` record contributes only its delta (spec 0103).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UsageTotals {
+    input: u64,
+    output: u64,
+    cached: u64,
+}
+
+/// Token usage from a rollout's `event_msg`/`token_count` record. Codex
+/// stamps a cumulative `total_token_usage` (input includes cached; a
+/// snapshot may repeat unchanged), so emitting the delta against what was
+/// already reported both splits the stream into per-call Cost events and
+/// makes duplicates harmless. This supersedes the headless footer parse
+/// for interactive sessions — the footer only exists in `codex exec`
+/// output, which has no rollout watcher, so the two never overlap.
+fn codex_usage_cost(v: &Value, reported: &mut UsageTotals) -> Option<SessionEvent> {
+    if v.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = v.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        return None;
+    }
+    let total = rollout_usage_totals(payload)?;
+    let d_in = total.input.saturating_sub(reported.input);
+    let d_out = total.output.saturating_sub(reported.output);
+    let d_cached = total.cached.saturating_sub(reported.cached);
+    if d_in == 0 && d_out == 0 && d_cached == 0 {
+        return None;
+    }
+    reported.input = reported.input.max(total.input);
+    reported.output = reported.output.max(total.output);
+    reported.cached = reported.cached.max(total.cached);
+    Some(SessionEvent::Cost {
+        usd: 0.0,
+        tokens_in: d_in,
+        tokens_out: d_out,
+        tokens_cached: d_cached,
+    })
+}
+
+/// The cumulative `total_token_usage` from a `token_count` payload.
+fn rollout_usage_totals(payload: &Value) -> Option<UsageTotals> {
+    let total = payload.pointer("/info/total_token_usage")?;
+    let field = |k: &str| total.get(k).and_then(Value::as_u64).unwrap_or(0);
+    Some(UsageTotals {
+        input: field("input_tokens"),
+        output: field("output_tokens"),
+        cached: field("cached_input_tokens"),
+    })
+}
+
+/// The last cumulative usage snapshot already present in `path` — the
+/// baseline for a resumed session's watcher. Without this, the first live
+/// `token_count` after a resume would report the WHOLE conversation's
+/// historical usage as one giant delta on top of the totals the daemon
+/// already recounted from its own transcript.
+fn last_rollout_usage_totals(path: &Path) -> UsageTotals {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return UsageTotals::default();
+    };
+    let mut latest = UsageTotals::default();
+    for line in text.lines() {
+        if !line.contains("token_count") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) != Some("event_msg") {
+            continue;
+        }
+        if let Some(t) = v.get("payload").and_then(rollout_usage_totals) {
+            latest = t;
+        }
+    }
+    latest
 }
 
 /// The root session's active model, if `v` is a `turn_context` rollout
@@ -1105,6 +1198,63 @@ mod tests {
         assert_eq!(parse_token_count("hello"), None);
         assert_eq!(parse_token_count(""), None);
         assert_eq!(parse_token_count("12abc"), None);
+    }
+
+    #[test]
+    fn token_count_records_emit_delta_costs() {
+        // Real rollout shape: cumulative `total_token_usage` where `input_
+        // tokens` already includes the cached reads. Two snapshots →
+        // first emits its full totals, second emits only the delta, and a
+        // repeated (unchanged) snapshot emits nothing.
+        let snapshot = |input: u64, cached: u64, output: u64| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": input,
+                            "cached_input_tokens": cached,
+                            "output_tokens": output,
+                            "reasoning_output_tokens": 3,
+                            "total_tokens": input + output
+                        },
+                        "last_token_usage": {}
+                    }
+                }
+            })
+        };
+        let mut reported = UsageTotals::default();
+        match codex_usage_cost(&snapshot(19_094, 9_984, 184), &mut reported) {
+            Some(SessionEvent::Cost {
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                ..
+            }) => {
+                assert_eq!(tokens_in, 19_094);
+                assert_eq!(tokens_out, 184);
+                assert_eq!(tokens_cached, 9_984);
+            }
+            other => panic!("expected a Cost event: {other:?}"),
+        }
+        match codex_usage_cost(&snapshot(48_890, 19_968, 257), &mut reported) {
+            Some(SessionEvent::Cost {
+                tokens_in,
+                tokens_out,
+                tokens_cached,
+                ..
+            }) => {
+                assert_eq!(tokens_in, 29_796);
+                assert_eq!(tokens_out, 73);
+                assert_eq!(tokens_cached, 9_984);
+            }
+            other => panic!("expected a delta Cost event: {other:?}"),
+        }
+        assert!(
+            codex_usage_cost(&snapshot(48_890, 19_968, 257), &mut reported).is_none(),
+            "an unchanged snapshot must not re-report usage"
+        );
     }
 
     #[test]

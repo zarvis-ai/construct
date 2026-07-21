@@ -2052,6 +2052,12 @@ pub struct SessionSummary {
     /// self-heals for sessions recorded before the field existed.
     #[serde(default)]
     pub message_count: u64,
+    /// Lifetime token consumption, accumulated from `SessionEvent::Cost`
+    /// reports as they persist and recounted from the transcript at load
+    /// (spec 0103), so it self-heals like `message_count`. All-zero for
+    /// harnesses that never report usage.
+    #[serde(default, skip_serializing_if = "TokenTally::is_zero")]
+    pub tokens: TokenTally,
     /// How adapters that gate tools handle Risky tool calls.
     #[serde(default)]
     pub approval_mode: ApprovalMode,
@@ -2113,6 +2119,58 @@ pub struct NativeSubagentRef {
     pub projected_seq: u64,
 }
 
+/// A session's token consumption tally (spec 0103). Mirrors the fields of
+/// `SessionEvent::Cost`: `input` is the total prompt-side count *including*
+/// cache reads, `cached` the subset of `input` served from the provider's
+/// prompt cache. Used both as a lifetime accumulator on `SessionSummary`
+/// and as a boundary stamp on fork/merge records, so lineage windows get
+/// their token deltas by plain subtraction.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenTally {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub cached: u64,
+}
+
+impl TokenTally {
+    pub fn is_zero(&self) -> bool {
+        *self == TokenTally::default()
+    }
+
+    /// Model-work volume: input + output. What lineage labels display.
+    pub fn total(&self) -> u64 {
+        self.input.saturating_add(self.output)
+    }
+
+    pub fn add(&mut self, input: u64, output: u64, cached: u64) {
+        self.input = self.input.saturating_add(input);
+        self.output = self.output.saturating_add(output);
+        self.cached = self.cached.saturating_add(cached);
+    }
+
+    /// Field-wise saturating subtraction — a window's delta between two
+    /// checkpoint stamps.
+    pub fn saturating_sub(&self, other: &TokenTally) -> TokenTally {
+        TokenTally {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            cached: self.cached.saturating_sub(other.cached),
+        }
+    }
+
+    /// Field-wise max — checkpoint advancement (counters only grow).
+    pub fn max(&self, other: &TokenTally) -> TokenTally {
+        TokenTally {
+            input: self.input.max(other.input),
+            output: self.output.max(other.output),
+            cached: self.cached.max(other.cached),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForkedFrom {
     pub session_id: String,
@@ -2130,6 +2188,11 @@ pub struct ForkedFrom {
     /// events. `#[serde(default)]` for records predating it.
     #[serde(default)]
     pub parent_message_count: u64,
+    /// The parent's token tally at the moment this fork branched — the
+    /// token counterpart to `parent_message_count` (spec 0103). All-zero
+    /// for records predating it (lineage falls back to message counts).
+    #[serde(default, skip_serializing_if = "TokenTally::is_zero")]
+    pub parent_tokens: TokenTally,
     /// Set when this fork was synthesized automatically by a harness-native
     /// context reset (`/clear` and equivalents, spec 0085) rather than
     /// created by a user picking a harness and forking on purpose. Lineage
@@ -2160,6 +2223,10 @@ pub struct ForkMerge {
     /// the message-only counterpart to `merged_seq`.
     #[serde(default)]
     pub merged_message_count: u64,
+    /// The parent's token tally at the moment this fork merged back — the
+    /// token counterpart to `merged_message_count` (spec 0103).
+    #[serde(default, skip_serializing_if = "TokenTally::is_zero")]
+    pub merged_tokens: TokenTally,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -56,6 +56,7 @@ impl SessionManager {
                 s.last_event_at = Some(now);
                 s.event_count = 0;
                 s.message_count = 0;
+                s.tokens = Default::default();
                 s.last_pty_at_ms = None;
                 crate::session::set_state_tracked(
                     &mut s,
@@ -404,8 +405,14 @@ impl SessionManager {
                         s.last_prompt = Some(p.clone());
                     }
                 }
-                SessionEvent::Cost { usd, .. } => {
+                SessionEvent::Cost {
+                    usd,
+                    tokens_in,
+                    tokens_out,
+                    tokens_cached,
+                } => {
                     s.cost_usd = Some(s.cost_usd.unwrap_or(0.0) + *usd);
+                    s.tokens.add(*tokens_in, *tokens_out, *tokens_cached);
                 }
                 SessionEvent::Done { exit_code } => {
                     let terminal = if *exit_code == 0 {
@@ -628,6 +635,7 @@ impl SessionManager {
                 busy_running_since_ms: (state == SessionState::Running)
                     .then_some(now.timestamp_millis()),
                 message_count: 0,
+                tokens: Default::default(),
                 approval_mode: owner_summary.approval_mode,
                 kind: construct_protocol::SessionKind::Subagent,
                 archived: false,
