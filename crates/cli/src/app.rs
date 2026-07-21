@@ -10009,9 +10009,9 @@ impl App {
 
         let res = self.chord_state.handle(key, &self.keymap);
         self.chord_label = self.chord_state.label();
-        // Tutorial hook — step 1's pending-chord echo / C-g cancel / wrong-key
+        // Tutorial hook — step 1's pending-chord echo / cancel / wrong-key
         // correction is driven off the raw `KeymapResult`, since `C-x` and
-        // `C-g` alone never resolve to a `KeyAction` (spec 0077).
+        // `C-g` and `Esc` alone never resolve to a `KeyAction` (spec 0077).
         self.tutorial_observe_key_result(&res, key);
         match res {
             KeymapResult::Action(a) => self.run_action(a).await,
@@ -17148,27 +17148,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_ctrl_g_clears_active_selection() {
+    async fn program_escape_clears_active_selection() {
         let (mut app, _dir, server) = empty_app().await;
         app.program_popup = Some(program_popup_for_test("s1", "abcdef", 2));
         app.begin_program_selection();
         app.move_program_cursor(3);
         assert!(
             app.program_popup.as_ref().unwrap().selection.is_some(),
-            "selection should be active before C-g"
+            "selection should be active before Esc"
         );
 
-        app.handle_program_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
 
         let popup = app.program_popup.as_ref().unwrap();
-        assert!(popup.selection.is_none(), "C-g should clear the selection");
+        assert!(popup.selection.is_none(), "Esc should clear the selection");
         // Cancelling the mark must not mutate the buffer or move text around.
         assert_eq!(popup.buffer, "abcdef");
         assert_eq!(
             app.status.as_ref().map(|(status, _)| status.as_str()),
             Some("program selection canceled"),
-            "C-g should replace the stale selection-started status"
+            "Esc should replace the stale selection-started status"
         );
         assert_eq!(app.program_clipboard, None);
         server.abort();
@@ -18113,10 +18113,10 @@ mod tests {
             6,
             "during search the first match >= anchor is selected (cursor moves)"
         );
-        app.handle_program_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
         let popup = app.program_popup.as_ref().unwrap();
-        assert!(popup.search.is_none(), "C-g exits search");
+        assert!(popup.search.is_none(), "Esc exits search");
         assert_eq!(popup.cursor, 6);
         server.abort();
     }
@@ -31509,7 +31509,7 @@ mod tests {
             .await;
         assert_eq!(
             app.tutorial.as_ref().unwrap().step1_phase,
-            Step1Phase::AwaitCtrlG
+            Step1Phase::AwaitCancel
         );
         assert!(
             app.tutorial
@@ -31522,7 +31522,7 @@ mod tests {
             "C-x should show pending feedback"
         );
 
-        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
         assert_eq!(
             app.tutorial.as_ref().unwrap().step1_phase,
@@ -31536,7 +31536,7 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("cancelled"),
-            "C-g should advance the micro-exercise with a cancel message"
+            "Esc should advance the micro-exercise with a cancel message"
         );
 
         // A wrong key here (not the create-session chord) should show a
@@ -31559,12 +31559,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn step1_also_accepts_ctrl_g_cancel() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().step1_phase,
+            Step1Phase::AwaitNewSession,
+            "C-g remains a valid tutorial cancel key"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn completing_step1_opens_new_session_and_advances_to_step2() {
         let (mut app, _dir, server) = empty_app().await;
         app.tutorial_start();
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
-        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
