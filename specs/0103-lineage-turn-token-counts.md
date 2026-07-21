@@ -75,6 +75,8 @@ historical records where tokens are simply unknown.
   tok", each with its own compute time.
 - Hovering a window's turn-info line shows e.g.
   "5 msgs · in 118.2k · out 1.8k · cached 96.4k".
-- A codex window (unsplit total) hovers as "3 msgs · 2.3k tok total".
+- A window from a harness mode that reports only one unsplit figure
+  (e.g. a per-turn "tokens used" footer) hovers as
+  "3 msgs · 2.3k tok total".
 - A shell session's windows keep showing "N msgs" with wall-clock
   spans, exactly as before.
