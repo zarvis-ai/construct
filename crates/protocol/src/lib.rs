@@ -1998,6 +1998,10 @@ pub struct SessionSummary {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// True while `title` is a system-provided fork placeholder that the first
+    /// substantive prompt may replace through normal auto-title generation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_title_pending: bool,
     pub state: SessionState,
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

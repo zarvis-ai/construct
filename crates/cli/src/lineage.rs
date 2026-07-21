@@ -2162,6 +2162,7 @@ mod tests {
             harness: "smith".into(),
             cwd: "/tmp".into(),
             title: None,
+            auto_title_pending: false,
             state: SessionState::Running,
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
             last_event_at: None,

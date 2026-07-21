@@ -1567,7 +1567,9 @@ impl SessionManager {
                 // loaded summary; flagging "attempted" here stops the
                 // restart from re-running title-gen for already-titled
                 // sessions and is harmless for the rest.
-                title_gen_attempted: AtomicBool::new(s.title.is_some()),
+                title_gen_attempted: AtomicBool::new(
+                    s.title.is_some() && !s.auto_title_pending,
+                ),
                 pending_title_prompts: std::sync::Mutex::new(Vec::new()),
                 pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
                 pty_input_queue: std::sync::Mutex::new(None),
@@ -3814,7 +3816,7 @@ impl SessionManager {
     /// `/model gpt-5.5`-style messages are accumulated but don't trigger
     /// generation on their own), and (d) the smith adapter binary is
     /// configured + locatable. Silently no-ops on any miss.
-    fn maybe_spawn_auto_title(&self, entry: Arc<SessionEntry>, prompt: String) {
+    async fn maybe_spawn_auto_title(&self, entry: Arc<SessionEntry>, prompt: String) {
         // Cheap checks first so we don't burn the per-session attempt
         // budget (the AtomicBool flip is one-way until a daemon
         // restart) on inputs that wouldn't have produced a title
@@ -3861,10 +3863,20 @@ impl SessionManager {
         if entry.title_gen_attempted.swap(true, Ordering::SeqCst) {
             return;
         }
+        let replace_pending_title = entry.summary.read().await.auto_title_pending;
         let storage = self.storage.clone();
         let broadcast_tx = self.broadcast.clone();
         tokio::spawn(async move {
-            generate_auto_title(binary, prefix_args, entry, combined, storage, broadcast_tx).await;
+            generate_auto_title(
+                binary,
+                prefix_args,
+                entry,
+                combined,
+                replace_pending_title,
+                storage,
+                broadcast_tx,
+            )
+            .await;
         });
     }
 
@@ -4440,9 +4452,13 @@ impl SessionManager {
         let normalized = title
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
+        // Every explicit update, including clearing the title, opts a fork out
+        // of pending first-prompt auto-title generation.
+        entry.title_gen_attempted.store(true, Ordering::SeqCst);
         let snapshot = {
             let mut s = entry.summary.write().await;
             s.title = normalized;
+            s.auto_title_pending = false;
             s.clone()
         };
         self.storage.save_summary(&snapshot)?;
@@ -4719,6 +4735,7 @@ impl SessionManager {
             harness: harness.clone(),
             cwd,
             title: child_title,
+            auto_title_pending: false,
             state: construct_protocol::SessionState::Done,
             created_at: now,
             last_event_at: None,
@@ -5015,6 +5032,7 @@ async fn generate_auto_title(
     prefix_args: Vec<String>,
     entry: Arc<SessionEntry>,
     prompt: String,
+    replace_pending_title: bool,
     storage: Arc<Storage>,
     broadcast: tokio::sync::broadcast::Sender<BroadcastMsg>,
 ) {
@@ -5053,15 +5071,20 @@ async fn generate_auto_title(
     }
     let snapshot = {
         let mut s = entry.summary.write().await;
-        // Don't clobber a title the user set after we kicked this off.
-        if s.title
-            .as_ref()
-            .map(|t| !t.trim().is_empty())
-            .unwrap_or(false)
-        {
+        // Apply only if the same eligibility that launched generation still
+        // holds. A manual rename (including clearing the title) clears a fork's
+        // pending bit, so an in-flight result cannot clobber that choice.
+        let title_is_empty = s.title.as_ref().is_none_or(|t| t.trim().is_empty());
+        let still_eligible = if replace_pending_title {
+            s.auto_title_pending
+        } else {
+            !s.auto_title_pending && title_is_empty
+        };
+        if !still_eligible {
             return;
         }
         s.title = Some(title.clone());
+        s.auto_title_pending = false;
         s.clone()
     };
     if let Err(e) = storage.save_summary(&snapshot) {
@@ -5377,6 +5400,7 @@ mod tests {
             harness: "smith".to_string(),
             cwd: "/tmp".to_string(),
             title: None,
+            auto_title_pending: false,
             state: SessionState::Running,
             created_at: "2026-06-17T00:00:00Z".parse().expect("timestamp"),
             last_event_at: None,
@@ -5872,6 +5896,7 @@ mod tests {
                 harness: "shell".into(),
                 cwd: "/tmp".into(),
                 title: None,
+                auto_title_pending: false,
                 state: SessionState::Running,
                 created_at: Utc::now(),
                 last_event_at: None,
@@ -7791,6 +7816,7 @@ mod tests {
             harness: "shell".into(),
             cwd: "/tmp".into(),
             title: None,
+            auto_title_pending: false,
             state: SessionState::Running,
             created_at: Utc::now(),
             last_event_at: None,
@@ -7937,6 +7963,7 @@ mod tests {
             harness: "grok".into(),
             cwd: "/tmp".into(),
             title: None,
+            auto_title_pending: false,
             state: SessionState::AwaitingInput,
             created_at: Utc::now(),
             last_event_at: None,

@@ -2465,6 +2465,7 @@ mod search_tests {
             harness: harness.to_string(),
             cwd: "/tmp".into(),
             title: title.map(str::to_string),
+            auto_title_pending: false,
             state: SessionState::Running,
             created_at: at,
             last_event_at: Some(at),

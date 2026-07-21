@@ -18666,6 +18666,7 @@ mod tests {
             harness: harness.into(),
             cwd: "/tmp".into(),
             title: title.map(|t| t.to_string()),
+            auto_title_pending: false,
             state,
             created_at: chrono::Utc::now(),
             last_event_at: None,

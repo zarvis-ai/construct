@@ -66,6 +66,9 @@ impl SessionManager {
             harness: harness.to_string(),
             cwd: effective_cwd.to_string_lossy().to_string(),
             title: params.title.clone(),
+            // A lineage fork's `(fork) …` title is provisional until its first
+            // substantive user prompt or an explicit manual title update.
+            auto_title_pending: params.forked_from.is_some(),
             state: SessionState::Pending,
             created_at: now,
             last_event_at: None,
@@ -238,7 +241,9 @@ impl SessionManager {
             }),
             deleted: AtomicBool::new(false),
             archived: AtomicBool::new(summary.archived),
-            title_gen_attempted: AtomicBool::new(summary.title.is_some()),
+            title_gen_attempted: AtomicBool::new(
+                summary.title.is_some() && !summary.auto_title_pending,
+            ),
             pending_title_prompts: std::sync::Mutex::new(Vec::new()),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             pty_input_queue: std::sync::Mutex::new(None),
