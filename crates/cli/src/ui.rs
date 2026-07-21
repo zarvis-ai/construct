@@ -7795,16 +7795,16 @@ fn modeline_model_text(model: Option<&str>, effort: Option<&str>) -> String {
 }
 
 /// The modeline's detailed context indicator and the number of its text cells
-/// covered by the filled part of its background bar, when a window is known.
+/// covered by the filled part of its background bar.
 fn modeline_context_usage_text(
     used: Option<u64>,
     window: Option<u64>,
-) -> Option<(String, Option<usize>)> {
+) -> Option<(String, usize)> {
     let used = used?;
     let Some(window) = window.filter(|window| *window > 0) else {
         return Some((
-            format!(" {} used", crate::lineage::format_token_count(used)),
-            None,
+            format!("  {} used ", crate::lineage::format_token_count(used)),
+            0,
         ));
     };
     let text = format!(
@@ -7817,7 +7817,7 @@ fn modeline_context_usage_text(
     // final spaces are padding within the bar itself.
     let text_cells = UnicodeWidthStr::width(&text[1..]);
     let filled_cells = (text_cells * used.min(window) as usize).div_ceil(window as usize);
-    Some((text, Some(filled_cells)))
+    Some((text, filled_cells))
 }
 
 fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
@@ -8008,47 +8008,29 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
             .mouse_pos
             .zip(app.layout.modeline_context_gauge_hit)
             .is_some_and(|((col, row), hit)| hit.contains(col, row));
-        if let Some(filled_cells) = filled_cells {
-            for (index, ch) in gauge.chars().enumerate() {
-                let bar_cell = index > 0;
-                let background = if !bar_cell {
-                    app.theme.modeline_bg
-                } else if index - 1 < filled_cells {
-                    if hovered {
-                        app.theme.text
-                    } else {
-                        app.theme.modeline_fg
-                    }
+        for (index, ch) in gauge.chars().enumerate() {
+            let bar_cell = index > 0;
+            let background = if !bar_cell {
+                app.theme.modeline_bg
+            } else if index - 1 < filled_cells {
+                if hovered {
+                    app.theme.text
                 } else {
-                    app.theme.dim
-                };
-                spans.push(Span::styled(
-                    ch.to_string(),
-                    Style::default()
-                        .bg(background)
-                        .fg(if bar_cell {
-                            app.theme.modeline_bg
-                        } else {
-                            app.theme.modeline_fg
-                        })
-                        .add_modifier(if hovered && bar_cell {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ));
-            }
-        } else {
+                    app.theme.modeline_fg
+                }
+            } else {
+                app.theme.dim
+            };
             spans.push(Span::styled(
-                gauge,
+                ch.to_string(),
                 Style::default()
-                    .bg(app.theme.modeline_bg)
-                    .fg(if hovered {
-                        app.theme.text
+                    .bg(background)
+                    .fg(if bar_cell {
+                        app.theme.modeline_bg
                     } else {
                         app.theme.modeline_fg
                     })
-                    .add_modifier(if hovered {
+                    .add_modifier(if hovered && bar_cell {
                         Modifier::BOLD
                     } else {
                         Modifier::empty()
@@ -18636,15 +18618,15 @@ mod tests {
     fn modeline_context_usage_shows_full_token_text_over_a_bar() {
         assert_eq!(
             modeline_context_usage_text(Some(12_400), Some(258_400)),
-            Some(("  12k/258k 4% ".to_string(), Some(1)))
+            Some(("  12k/258k 4% ".to_string(), 1))
         );
         assert_eq!(
             modeline_context_usage_text(Some(74_200), None),
-            Some((" 74k used".to_string(), None))
+            Some(("  74k used ".to_string(), 0))
         );
         assert_eq!(
             modeline_context_usage_text(Some(500), Some(0)),
-            Some((" 500 used".to_string(), None))
+            Some(("  500 used ".to_string(), 0))
         );
         assert_eq!(modeline_context_usage_text(None, Some(258_400)), None);
     }

@@ -20,12 +20,11 @@ The TUI modeline renders the gauge immediately after the model name as
 `used/window %` — for example `12.4k/258k 5%` — with that label drawn over a
 proportional background bar. Used capacity uses the normal modeline color and
 remaining capacity is dimmed, while the label remains readable on top.
-Hovering the label reveals the exact `used / window` token counts. The
-graphical indicator is shown only when the harness states its window; the
-window is never guessed from model names or hardcoded tables outside the
-harness's own report. When a harness reports usage without a window, the
-modeline instead shows a plain `used` label without a bar; its tooltip reports
-the exact used count.
+Hovering the label reveals the exact `used / window` token counts. The window
+is never guessed from model names or hardcoded tables outside the harness's
+own report. When a harness reports usage without a window, the modeline shows
+the `used` label over an all-dim (zero-percent) bar; its tooltip reports the
+exact used count.
 
 ## Reason
 
@@ -45,8 +44,9 @@ the different question "how full is this conversation right now?".
   into the fresh conversation.
 - Repeated identical snapshots must not spam the transcript; adapters
   report on change.
-- Clients render the detailed ratio and bar only for used+window. Used-only
-  reports render a plain used-token label rather than implying a denominator.
+- Clients render the detailed ratio only for used+window. Used-only reports
+  render a used-token label over a zero-percent bar rather than implying a
+  denominator.
 
 ## Non-Goals
 
