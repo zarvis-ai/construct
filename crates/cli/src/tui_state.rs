@@ -83,6 +83,10 @@ pub struct TuiState {
     /// ignored rather than migrated.
     #[serde(default)]
     pub lineage_compact: bool,
+    /// Whether the session list is in the two-line full-card view. The
+    /// default is the one-line compact view.
+    #[serde(default)]
+    pub session_list_full: bool,
 }
 
 impl Default for TuiState {
@@ -106,6 +110,7 @@ impl Default for TuiState {
             lineage_collapsed: false,
             lineage_h: None,
             lineage_compact: false,
+            session_list_full: false,
         }
     }
 }
@@ -255,6 +260,22 @@ mod tests {
         .expect("legacy");
         assert!(!legacy.lineage_collapsed);
         assert!(!legacy.lineage_compact);
+    }
+
+    #[test]
+    fn state_round_trips_session_list_view_mode() {
+        let state = TuiState {
+            session_list_full: true,
+            ..TuiState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.session_list_full);
+
+        // Legacy blobs default to the compact one-line view.
+        let legacy: TuiState =
+            serde_json::from_str(r#"{"last_selected_session_id": "s1"}"#).expect("legacy");
+        assert!(!legacy.session_list_full);
     }
 
     #[test]

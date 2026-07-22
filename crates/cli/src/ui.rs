@@ -152,6 +152,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.main_window_dividers.clear();
     app.layout.session_title_name_hits.clear();
     app.layout.session_harness_hits.clear();
+    app.layout.list_visible_rows.clear();
+    app.layout.list_mode_toggle_hit = None;
     app.layout.lineage_area = None;
     app.layout.lineage_header_hit = None;
     app.layout.lineage_collapse_hit = None;
@@ -610,8 +612,17 @@ fn hovered_diamond(app: &App) -> Option<(u16, u16, &SessionSummary)> {
         return None;
     }
     let row = (my - list_area.y - 1) as usize;
+    // Same display-row → item mapping as `App::click_list`: the render-time
+    // row map when the list was drawn this frame (full-mode cards span two
+    // rows; the diamond gutter lives on the first), 1:1 otherwise.
+    let idx = match app.layout.list_visible_rows.get(row) {
+        Some(hit) if hit.first_line => hit.item_index,
+        Some(_) => return None,
+        None if app.layout.list_visible_rows.is_empty() => row,
+        None => return None,
+    };
     let items = app.list_items();
-    let item = items.into_iter().nth(row)?;
+    let item = items.into_iter().nth(idx)?;
     let (summary, indented, has_children) = match item {
         AppListItem::Session {
             summary,
@@ -651,6 +662,36 @@ pub fn list_plus_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
         return None;
     }
     Some((list_area.x + 1, list_area.x + 3, list_area.y))
+}
+
+/// Label text of the session list's view-mode toggle: the current mode's
+/// one-word name plus a swap glyph, exactly like the lineage header's
+/// ` full ⇄ ` / ` compact ⇄ ` toggle. The surrounding spaces are part of
+/// the click target.
+pub fn list_mode_button_label(mode: crate::app::SessionListViewMode) -> String {
+    format!(" {} \u{21c4} ", mode.short_label())
+}
+
+/// Hit zone for the view-mode toggle label on the session list's top
+/// border: right-aligned immediately left of the `«` collapse button,
+/// mirroring the lineage header's layout. Returns
+/// `(x_start, x_end_exclusive, y)`, or `None` when the pane is too narrow
+/// to fit the label after the ` + sessions ` title.
+pub fn list_mode_button_range(
+    list_area: Rect,
+    mode: crate::app::SessionListViewMode,
+) -> Option<(u16, u16, u16)> {
+    let label_w = UnicodeWidthStr::width(list_mode_button_label(mode).as_str()) as u16;
+    // The ` « ` collapse button occupies the 3 cells before the corner
+    // (`list_collapse_button_range`); the label ends flush against it.
+    let x_end = list_area.x + list_area.width.saturating_sub(4);
+    let x_start = x_end.saturating_sub(label_w);
+    // The left title ` + sessions ` renders from `x + 1` through `x + 12`;
+    // keep a one-cell gap so the two never collide.
+    if x_start <= list_area.x.saturating_add(13) {
+        return None;
+    }
+    Some((x_start, x_end, list_area.y))
 }
 
 /// Hit zone for the right-aligned `«` button that collapses the
@@ -832,6 +873,16 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
     if let Some((xs, xe, y)) = list_plus_button_range(list) {
         if my == y && mx >= xs && mx < xe {
             render_button_tooltip(f, &app.theme, " New session ", xs, y);
+            return;
+        }
+    }
+    if let Some(hit) = app.layout.list_mode_toggle_hit {
+        if my == hit.y && mx >= hit.x && mx < hit.x + hit.width {
+            let label = match app.list_mode {
+                crate::app::SessionListViewMode::Compact => " Switch to full rows ",
+                crate::app::SessionListViewMode::Full => " Switch to compact rows ",
+            };
+            render_button_tooltip(f, &app.theme, label, hit.x, hit.y);
             return;
         }
     }
@@ -1930,6 +1981,161 @@ fn session_list_secondary_style(theme: &Theme) -> Style {
     Style::default().fg(theme.muted)
 }
 
+/// The muted second row of a full-mode session card, aligned under the
+/// name: model·effort, context gauge, activity, tokens — dropping the
+/// least important segments first when the pane is narrow.
+fn session_detail_line(
+    app: &App,
+    s: &SessionSummary,
+    prefix_w: usize,
+    row_w: usize,
+) -> Line<'static> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let avail = row_w.saturating_sub(prefix_w);
+    let text = fit_detail_segments(session_detail_segments(s, now_ms), avail);
+    let style = if s.archived {
+        Style::default()
+            .fg(app.theme.dim)
+            .add_modifier(Modifier::DIM)
+    } else {
+        session_list_secondary_style(&app.theme)
+    };
+    Line::from(vec![
+        Span::raw(" ".repeat(prefix_w)),
+        Span::styled(text, style),
+    ])
+}
+
+/// `(text, keep-priority)` segments of a full-mode detail line, in display
+/// order. Higher priority survives a narrow pane longer: the context gauge
+/// ("how full is it") outranks the model, which outranks activity and
+/// tokens. Absent data is omitted rather than shown as placeholders; a
+/// session reporting nothing at all (e.g. a plain shell) falls back to
+/// where it lives.
+fn session_detail_segments(s: &SessionSummary, now_ms: i64) -> Vec<(String, u8)> {
+    let mut segs: Vec<(String, u8)> = Vec::new();
+    if let Some(model) = s.model.as_deref() {
+        let mut label = short_model_label(model);
+        if let Some(effort) = s.effort.as_deref() {
+            label = format!("{label}\u{00b7}{effort}");
+        }
+        segs.push((label, 3));
+    }
+    match (s.context_used, s.context_window.filter(|w| *w > 0)) {
+        (Some(used), Some(window)) => segs.push((context_gauge_label(used, window), 4)),
+        (Some(used), None) => segs.push((
+            format!("{} ctx", crate::lineage::format_token_count(used)),
+            4,
+        )),
+        _ => {}
+    }
+    if s.state == SessionState::Running {
+        let since = s.busy_running_since_ms.unwrap_or(now_ms);
+        segs.push((
+            format!(
+                "busy {}",
+                crate::lineage::format_duration_ms(now_ms.saturating_sub(since).max(0) as u64)
+            ),
+            2,
+        ));
+    } else if let Some(at) = s.last_event_at {
+        segs.push((
+            format!(
+                "{} ago",
+                format_age_ms(now_ms.saturating_sub(at.timestamp_millis()).max(0) as u64)
+            ),
+            2,
+        ));
+    }
+    if !s.tokens.is_zero() {
+        segs.push((
+            format!(
+                "{} tok",
+                crate::lineage::format_token_count(s.tokens.total())
+            ),
+            1,
+        ));
+    }
+    if segs.is_empty() {
+        let dir = s.worktree.as_deref().unwrap_or(&s.cwd);
+        let tail = std::path::Path::new(dir)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(dir);
+        segs.push((tail.to_string(), 0));
+    }
+    segs
+}
+
+/// Join segments with two-space gaps, dropping the lowest-priority
+/// segment until the line fits `avail` cells. A single over-wide
+/// survivor is ellipsized instead of overflowing.
+fn fit_detail_segments(mut segs: Vec<(String, u8)>, avail: usize) -> String {
+    loop {
+        let text = segs
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("  ");
+        if UnicodeWidthStr::width(text.as_str()) <= avail {
+            return text;
+        }
+        if segs.len() <= 1 {
+            return fit_name(&text, avail, None);
+        }
+        let drop = segs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, p))| *p)
+            .map(|(i, _)| i)
+            .expect("segs is non-empty");
+        segs.remove(drop);
+    }
+}
+
+/// Four-cell context-window gauge plus percentage, e.g. `▰▰▱▱ 52%`.
+/// Fill rounds to the NEAREST quarter so the bar tracks the percentage —
+/// 54% reads as two cells (just over half), not three as ceiling would give.
+fn context_gauge_label(used: u64, window: u64) -> String {
+    let pct = used.saturating_mul(100) / window;
+    let filled = ((used.min(window).saturating_mul(4) + window / 2) / window) as usize;
+    let mut bar = String::new();
+    for i in 0..4 {
+        bar.push(if i < filled { '▰' } else { '▱' });
+    }
+    format!("{bar} {pct}%")
+}
+
+/// Compact model name for the detail line: drops the vendor prefix and a
+/// trailing date stamp — `claude-haiku-4-5-20251001` → `haiku-4-5`.
+fn short_model_label(model: &str) -> String {
+    let base = model.strip_prefix("claude-").unwrap_or(model);
+    match base.rsplit_once('-') {
+        Some((head, tail))
+            if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_digit()) && !head.is_empty() =>
+        {
+            head.to_string()
+        }
+        _ => base.to_string(),
+    }
+}
+
+/// Coarse single-unit age label: `42s`, `12m`, `3h`, `2d`. Unlike
+/// `format_duration_ms`, ages beyond an hour stay one short unit instead
+/// of growing into minute counts.
+fn format_age_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
 fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     // Tutorial pane highlight (spec 0077, step 4 "get around"): reuses
     // `pane_border_style`'s focused styling as the highlight rather than
@@ -1957,10 +2163,12 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
         clear_pane_side_borders(f, area, app);
         return;
     }
-    // Expanded render path: title is ` + sessions ` with a
-    // right-aligned ` « ` for collapse. Both are clickable; the
-    // click handler in `App::click_list` consults
-    // `list_title_button_hit` for the geometry.
+    // Expanded render path: title is ` + sessions ` at the left; at the
+    // right sit the view-mode toggle label (` compact ⇄ ` / ` full ⇄ `)
+    // and the ` « ` collapse button — the same right-aligned pairing as
+    // the lineage section header. All are clickable; the click handler in
+    // `App::click_list` consults `list_title_button_hit` /
+    // `list_mode_toggle_hit` for the geometry.
     let plus_style = Style::default()
         .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
@@ -1969,6 +2177,24 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
         Span::styled("+", plus_style),
         Span::raw(" sessions "),
     ]);
+    let mode_range = list_mode_button_range(area, app.list_mode);
+    let mode_hovered = match (app.mouse_pos, mode_range) {
+        (Some((mx, my)), Some((xs, xe, y))) => my == y && mx >= xs && mx < xe,
+        _ => false,
+    };
+    let mode_style = if mode_hovered {
+        Style::default()
+            .fg(app.theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(app.theme.muted)
+    };
+    app.layout.list_mode_toggle_hit = mode_range.map(|(xs, xe, y)| Rect {
+        x: xs,
+        y,
+        width: xe.saturating_sub(xs),
+        height: 1,
+    });
     let minus_hovered = match app.mouse_pos {
         Some((mx, my)) => list_collapse_button_range(area)
             .map(|(xs, xe, y)| my == y && mx >= xs && mx < xe)
@@ -1982,8 +2208,16 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Style::default().fg(app.theme.muted)
     };
+    let mut collapse_spans = Vec::new();
+    if mode_range.is_some() {
+        collapse_spans.push(Span::styled(
+            list_mode_button_label(app.list_mode),
+            mode_style,
+        ));
+    }
+    collapse_spans.push(Span::styled(" « ", minus_style));
     let collapse_line =
-        Line::from(Span::styled(" « ", minus_style)).alignment(ratatui::layout::Alignment::Right);
+        Line::from(collapse_spans).alignment(ratatui::layout::Alignment::Right);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border_style(&app.theme, focused))
@@ -1995,7 +2229,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     let row_w = (area.width as usize).saturating_sub(2);
     let app_items = app.list_items();
     let mut selected_idx: Option<usize> = None;
-    let items: Vec<ListItem> = app_items
+    let item_lines: Vec<Vec<Line>> = app_items
         .iter()
         .enumerate()
         .map(|(i, item)| {
@@ -2109,7 +2343,11 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                         Span::raw(gap_str),
                         Span::styled(harness, harness_style(&app.theme)),
                     ]);
-                    ListItem::new(Line::from(spans))
+                    let mut lines = vec![Line::from(spans)];
+                    if app.list_mode == crate::app::SessionListViewMode::Full {
+                        lines.push(session_detail_line(app, s, prefix_w, row_w));
+                    }
+                    lines
                 }
                 AppListItem::GroupHeader {
                     group,
@@ -2117,7 +2355,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     attention_rollup,
                 } => {
                     let glyph = if group.collapsed { "▶" } else { "▼" };
-                    ListItem::new(Line::from(vec![
+                    vec![Line::from(vec![
                         Span::styled(format!("{glyph} "), Style::default().fg(app.theme.group)),
                         Span::styled(group.name.clone(), group_name_style(&app.theme)),
                         Span::styled(
@@ -2129,7 +2367,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                             format!("({member_count})"),
                             session_list_secondary_style(&app.theme),
                         ),
-                    ]))
+                    ])]
                 }
                 AppListItem::ArchivedRow {
                     section,
@@ -2155,10 +2393,10 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                         *indented,
                         parent_grouped,
                     ) as usize);
-                    ListItem::new(Line::from(Span::styled(
+                    vec![Line::from(Span::styled(
                         format!("{indent}{disclosure} {count} archived"),
                         session_list_secondary_style(&app.theme),
-                    )))
+                    ))]
                 }
             }
         })
@@ -2207,14 +2445,34 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
         app.lineage_h,
         lineage_h_scrollbar,
     );
-    let max_scroll = app_items
-        .len()
-        .saturating_sub(list_items_area.height as usize);
+    let max_scroll = app.list_max_scroll(&app_items, list_items_area.height as usize);
     app.list_scroll_offset = app.list_scroll_offset.min(max_scroll);
     let visible_start = app.list_scroll_offset;
-    let visible_end = visible_start
-        .saturating_add(list_items_area.height as usize)
-        .min(items.len());
+    // Take items until the next would overflow the viewport, recording the
+    // display-row → item map for click/hover hit-testing as we go. Every
+    // included item is fully visible, so ratatui's `ListState` never scrolls
+    // internally and the map stays authoritative. A viewport shorter than a
+    // single item still includes it (clipped) rather than showing nothing.
+    let mut visible_end = visible_start;
+    let mut used_rows = 0usize;
+    app.layout.list_visible_rows.clear();
+    for (i, item) in app_items.iter().enumerate().skip(visible_start) {
+        let h = app.list_item_display_height(item);
+        if visible_end > visible_start && used_rows + h > list_items_area.height as usize {
+            break;
+        }
+        for line_no in 0..h {
+            app.layout.list_visible_rows.push(crate::app::ListRowHit {
+                item_index: i,
+                first_line: line_no == 0,
+            });
+        }
+        used_rows += h;
+        visible_end = i + 1;
+    }
+    app.layout
+        .list_visible_rows
+        .truncate(list_items_area.height as usize);
     let selected_visible_idx = selected_idx.and_then(|idx| {
         if idx >= visible_start && idx < visible_end {
             Some(idx - visible_start)
@@ -2222,10 +2480,9 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
             None
         }
     });
-    let items: Vec<ListItem> = items
-        .into_iter()
-        .skip(visible_start)
-        .take(list_items_area.height as usize)
+    let items: Vec<ListItem> = item_lines[visible_start..visible_end]
+        .iter()
+        .map(|lines| ListItem::new(lines.clone()))
         .collect();
     let mut state = ListState::default();
     state.select(if matches!(app.selection, Selection::None) {
@@ -2263,7 +2520,11 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     if show_list_scrollbar && max_scroll > 0 && list_items_area.width > 0 {
         let track_h = list_items_area.height as usize;
         if track_h > 0 {
-            let thumb_h = (track_h * track_h / app_items.len().max(1)).clamp(1, track_h);
+            let total_rows: usize = app_items
+                .iter()
+                .map(|item| app.list_item_display_height(item))
+                .sum();
+            let thumb_h = (track_h * track_h / total_rows.max(1)).clamp(1, track_h);
             let max_top = track_h - thumb_h;
             let top = (app.list_scroll_offset * max_top + max_scroll / 2) / max_scroll;
             let x = list_items_area.x + list_items_area.width - 1;
@@ -2304,7 +2565,8 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     // threading a push through the item-building closure above) — recomputes
     // the harness width already computed there, mirroring the same tradeoff
     // `hovered_diamond` already makes for its own hit zone.
-    for (offset, item) in app_items[visible_start..visible_end].iter().enumerate() {
+    let mut hit_y = list_items_area.y;
+    for item in app_items[visible_start..visible_end].iter() {
         if let AppListItem::Session { summary, .. } = item {
             let harness_w = harness_label(summary).chars().count() as u16;
             let x_end = list_items_area.x + list_items_area.width;
@@ -2314,9 +2576,10 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     session_id: summary.id.clone(),
                     x_start: x_end.saturating_sub(harness_w),
                     x_end,
-                    y: list_items_area.y + offset as u16,
+                    y: hit_y,
                 });
         }
+        hit_y = hit_y.saturating_add(app.list_item_display_height(item) as u16);
     }
     clear_pane_side_borders(f, area, app);
     if let (Some(rect), Some((id, mut rows))) = (lineage_rect, lineage) {
@@ -17835,6 +18098,117 @@ mod tests {
             "event_count": 3,
         });
         serde_json::from_value(json).expect("valid SessionSummary")
+    }
+
+    #[test]
+    fn detail_segments_show_model_gauge_activity_and_tokens() {
+        let mut s = lineage_test_summary("s1");
+        s.model = Some("claude-opus-4-8".into());
+        s.effort = Some("high".into());
+        s.context_used = Some(100_000);
+        s.context_window = Some(200_000);
+        s.busy_running_since_ms = Some(1_000); // fixture state is `running`
+        s.tokens = construct_protocol::TokenTally {
+            input: 200_000,
+            output: 13_000,
+            cached: 0,
+        };
+        // Cost is deliberately NOT part of the detail line, even when the
+        // session reports one.
+        s.cost_usd = Some(1.42);
+        let segs = session_detail_segments(&s, 61_000);
+        let texts: Vec<&str> = segs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["opus-4-8\u{00b7}high", "▰▰▱▱ 50%", "busy 1m00s", "213k tok"]
+        );
+        // The gauge outlives everything else on a narrow pane; tokens drop
+        // first.
+        let gauge_priority = segs.iter().map(|(_, p)| *p).max().unwrap();
+        assert_eq!(segs[1].1, gauge_priority);
+        let min_priority = segs.iter().map(|(_, p)| *p).min().unwrap();
+        assert_eq!(segs.last().unwrap().1, min_priority);
+    }
+
+    #[test]
+    fn detail_segments_idle_age_and_shell_fallback() {
+        use chrono::TimeZone;
+        let mut s = lineage_test_summary("s1");
+        s.state = SessionState::Done;
+        s.last_event_at = Some(chrono::Utc.timestamp_millis_opt(0).unwrap());
+        let segs = session_detail_segments(&s, 7_200_000);
+        assert_eq!(segs[0].0, "2h ago");
+
+        // A session reporting no model/usage data at all (a plain shell)
+        // falls back to where it lives.
+        let mut sh = lineage_test_summary("sh");
+        sh.state = SessionState::AwaitingInput;
+        sh.cwd = "/Users/moon/agentd".into();
+        let segs = session_detail_segments(&sh, 0);
+        assert_eq!(segs, vec![("agentd".to_string(), 0)]);
+    }
+
+    #[test]
+    fn fit_detail_segments_drops_lowest_priority_first_then_ellipsizes() {
+        let segs = vec![
+            ("aaaa".to_string(), 3),
+            ("bbbb".to_string(), 4),
+            ("cccc".to_string(), 0),
+        ];
+        assert_eq!(fit_detail_segments(segs.clone(), 20), "aaaa  bbbb  cccc");
+        assert_eq!(fit_detail_segments(segs.clone(), 12), "aaaa  bbbb");
+        assert_eq!(fit_detail_segments(segs.clone(), 5), "bbbb");
+        assert_eq!(fit_detail_segments(segs, 2), "b…");
+    }
+
+    #[test]
+    fn short_model_label_strips_vendor_prefix_and_date_stamp() {
+        assert_eq!(short_model_label("claude-opus-4-8"), "opus-4-8");
+        assert_eq!(short_model_label("claude-haiku-4-5-20251001"), "haiku-4-5");
+        assert_eq!(short_model_label("gpt-5.2-codex"), "gpt-5.2-codex");
+        assert_eq!(short_model_label("20251001"), "20251001");
+    }
+
+    #[test]
+    fn format_age_stays_one_short_unit() {
+        assert_eq!(format_age_ms(42_000), "42s");
+        assert_eq!(format_age_ms(12 * 60_000), "12m");
+        assert_eq!(format_age_ms(3 * 3_600_000), "3h");
+        assert_eq!(format_age_ms(2 * 86_400_000), "2d");
+    }
+
+    #[test]
+    fn context_gauge_fill_rounds_to_nearest_quarter() {
+        assert_eq!(context_gauge_label(50_000, 200_000), "▰▱▱▱ 25%");
+        assert_eq!(context_gauge_label(200_000, 200_000), "▰▰▰▰ 100%");
+        // Just over half fills two cells, not three — the bar tracks the
+        // percentage instead of ceiling up.
+        assert_eq!(context_gauge_label(54_000, 100_000), "▰▰▱▱ 54%");
+        // ...and rounds up only past the midpoint of a quarter.
+        assert_eq!(context_gauge_label(63_000, 100_000), "▰▰▰▱ 63%");
+        assert_eq!(context_gauge_label(1, 200_000), "▱▱▱▱ 0%");
+    }
+
+    #[test]
+    fn list_mode_button_right_aligns_before_collapse_and_hides_when_narrow() {
+        let list = Rect::new(0, 0, 40, 20);
+        let (xs, xe, y) = list_mode_button_range(list, crate::app::SessionListViewMode::Compact)
+            .expect("wide pane fits the label");
+        assert_eq!(y, list.y);
+        // The label ends flush against the ` « ` collapse button (which
+        // occupies the 3 cells before the corner), like the lineage header.
+        let (collapse_xs, _, _) = list_collapse_button_range(list).expect("collapse button");
+        assert_eq!(xe, collapse_xs);
+        // ` compact ⇄ ` is 11 cells.
+        assert_eq!(xs, xe - 11);
+        // Too narrow to clear the ` + sessions ` title → no label at all.
+        assert_eq!(
+            list_mode_button_range(
+                Rect::new(0, 0, 26, 20),
+                crate::app::SessionListViewMode::Compact
+            ),
+            None
+        );
     }
 
     /// A root + fork + subagent fixture, flattened into diagram rows.

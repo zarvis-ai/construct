@@ -242,8 +242,9 @@ impl App {
             return;
         }
         self.focus = PaneFocus::List;
-        // Title bar buttons: `+` (left, new session) and `«`
-        // (right, collapse). Both live on the top border row.
+        // Title bar buttons: `+` (left, new session), the view-mode label
+        // (after the title), and `«` (right, collapse). All live on the top
+        // border row.
         if row == list.y {
             if let Some((xs, xe, y)) = crate::ui::list_plus_button_range(list) {
                 if row == y && col >= xs && col < xe {
@@ -251,6 +252,14 @@ impl App {
                         .await;
                     return;
                 }
+            }
+            if self
+                .layout
+                .list_mode_toggle_hit
+                .is_some_and(|r| Self::rect_contains(r, col, row))
+            {
+                self.list_mode = self.list_mode.toggled();
+                return;
             }
             if let Some((xs, xe, y)) = crate::ui::list_collapse_button_range(list) {
                 if row == y && col >= xs && col < xe {
@@ -285,7 +294,18 @@ impl App {
             return;
         }
         let visible_row = (row - items_area.y) as usize;
-        let idx = visible_row + self.layout.list_scroll_offset;
+        // Display rows and items are 1:1 only in compact mode; full mode's
+        // two-row session cards need the render-time row map. An empty map
+        // (layouts fabricated without a render, e.g. in tests) falls back to
+        // the 1:1 compact mapping.
+        let (idx, first_line) = match self.layout.list_visible_rows.get(visible_row) {
+            Some(hit) => (hit.item_index, hit.first_line),
+            None if self.layout.list_visible_rows.is_empty() => {
+                (visible_row + self.layout.list_scroll_offset, true)
+            }
+            // Blank row past the last fully-visible item.
+            None => return,
+        };
         let items = self.list_items();
         if idx >= items.len() {
             return;
@@ -293,6 +313,8 @@ impl App {
         // Session rows reserve disclosure before the 4-cell pin/status gutter.
         // Disclosure clicks toggle nested subagents/forks; the gutter toggles
         // pinning. Must stay in lockstep with `hovered_diamond` in ui.rs.
+        // Both affordances are drawn on a card's first line only — a click in
+        // the same columns of the detail line is a plain row selection.
         if let ListItem::Session {
             summary,
             indented,
@@ -300,24 +322,26 @@ impl App {
             ..
         } = &items[idx]
         {
-            let indent = list_session_indent_cells(summary, *indented, *has_children);
-            let disclosure_col = list.x + 1 + indent;
-            if *has_children && col == disclosure_col {
-                let id = summary.id.clone();
-                if !self.children_collapsed.insert(id.clone()) {
-                    self.children_collapsed.remove(&id);
+            if first_line {
+                let indent = list_session_indent_cells(summary, *indented, *has_children);
+                let disclosure_col = list.x + 1 + indent;
+                if *has_children && col == disclosure_col {
+                    let id = summary.id.clone();
+                    if !self.children_collapsed.insert(id.clone()) {
+                        self.children_collapsed.remove(&id);
+                    }
+                    return;
                 }
-                return;
-            }
-            let zone_start = disclosure_col + u16::from(*has_children);
-            let zone_end = zone_start + 4;
-            if col >= zone_start && col < zone_end {
-                let id = summary.id.clone();
-                let next = !summary.pinned;
-                if let Err(e) = self.client.set_pinned(&id, next).await {
-                    self.set_status(format!("set_pinned failed: {e}"));
+                let zone_start = disclosure_col + u16::from(*has_children);
+                let zone_end = zone_start + 4;
+                if col >= zone_start && col < zone_end {
+                    let id = summary.id.clone();
+                    let next = !summary.pinned;
+                    if let Err(e) = self.client.set_pinned(&id, next).await {
+                        self.set_status(format!("set_pinned failed: {e}"));
+                    }
+                    return;
                 }
-                return;
             }
         }
         match &items[idx] {

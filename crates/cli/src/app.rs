@@ -1472,6 +1472,10 @@ pub struct App {
     /// top. Mouse wheel over the list adjusts this; keyboard selection still
     /// lets ratatui pull the selected item back into view when needed.
     pub list_scroll_offset: usize,
+    /// How the session list draws each session row (one-line compact vs
+    /// two-line full cards) — toggled from the pane's top border, mirroring
+    /// the lineage section's full/compact pair. Persisted across launches.
+    pub list_mode: SessionListViewMode,
     /// Scrollback offset (in rows) applied to the active/focused session's PTY
     /// parser when rendering zoomed or single-window views. Split windows keep
     /// their own offsets in `window_scrollback` so mouse-wheel scrolling one
@@ -2969,6 +2973,36 @@ impl From<construct_protocol::RemoteStartResult> for RemoteControlOk {
     }
 }
 
+/// How the session list draws each session row — toggled from the pane's
+/// top border, mirroring the lineage section's full/compact mode pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionListViewMode {
+    /// One line per session: markers + status glyph + name + harness.
+    #[default]
+    Compact,
+    /// Two lines per session: the compact line plus a muted detail line
+    /// (model·effort, context gauge, activity, tokens, cost).
+    Full,
+}
+
+impl SessionListViewMode {
+    pub fn toggled(self) -> Self {
+        match self {
+            SessionListViewMode::Compact => SessionListViewMode::Full,
+            SessionListViewMode::Full => SessionListViewMode::Compact,
+        }
+    }
+
+    /// One-word name shown on the pane's top-border toggle, next to the
+    /// ` + sessions ` title that already names the pane.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            SessionListViewMode::Compact => "compact",
+            SessionListViewMode::Full => "full",
+        }
+    }
+}
+
 /// Smallest list-pane width that still leaves room for the session
 /// status glyph + a couple chars of name. Below this drag is clamped.
 pub const LIST_PANEL_W_MIN: u16 = 18;
@@ -3124,6 +3158,16 @@ pub struct ListScrollbarHit {
     pub area: ratatui::layout::Rect,
     pub thumb: ratatui::layout::Rect,
     pub max_scroll: usize,
+}
+
+/// One rendered display row of the session list: which item it belongs to
+/// and whether it is that item's first line. Gutter affordances (disclosure
+/// triangle, pin diamond) live on the first line only; a click anywhere in
+/// the item's rows selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListRowHit {
+    pub item_index: usize,
+    pub first_line: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3284,6 +3328,16 @@ pub struct LayoutSnapshot {
     /// inside the matrix panel don't mis-fire as row selections, and
     /// it also bounds the visible window when the list scrolls.
     pub list_items_area: Option<ratatui::layout::Rect>,
+    /// Display-row → list-item map for the rows drawn inside
+    /// `list_items_area` this frame. One entry per screen row, top to
+    /// bottom. In full mode a session item spans two display rows, so
+    /// clicks can no longer assume one row per item; when this is empty
+    /// (list not rendered this frame, e.g. in tests that fabricate the
+    /// layout) hit-testing falls back to the 1:1 compact mapping.
+    pub list_visible_rows: Vec<ListRowHit>,
+    /// Clickable full/compact view-mode label on the list pane's top
+    /// border, when there was room to draw it.
+    pub list_mode_toggle_hit: Option<ratatui::layout::Rect>,
     /// Scroll offset of the session list (number of items scrolled
     /// off the top). Captured from `ListState::offset()` after the
     /// last render so click-to-row mapping stays correct when the
@@ -3884,6 +3938,7 @@ async fn run_with_socket_initial_selection(
         window_pane_sizes: HashMap::new(),
         zoom: initial_zoom,
         list_scroll_offset: 0,
+        list_mode: SessionListViewMode::Compact,
         view_scrollback: 0,
         window_scrollback: HashMap::new(),
         window_views: HashMap::new(),
@@ -3990,6 +4045,11 @@ async fn run_with_socket_initial_selection(
         crate::lineage::LineageViewMode::Rails
     } else {
         crate::lineage::LineageViewMode::Boxes
+    };
+    app.list_mode = if persisted.session_list_full {
+        SessionListViewMode::Full
+    } else {
+        SessionListViewMode::Compact
     };
 
     // Subscribe to all session events.
@@ -4129,6 +4189,7 @@ async fn run_with_socket_initial_selection(
         lineage_collapsed: app.lineage_collapsed,
         lineage_h: app.lineage_h,
         lineage_compact: app.lineage_mode == crate::lineage::LineageViewMode::Rails,
+        session_list_full: app.list_mode == SessionListViewMode::Full,
     });
 
     result
@@ -9594,12 +9655,34 @@ impl App {
             .list_items_area
             .map(|area| area.height as usize)
             .unwrap_or(0);
-        self.list_scroll_offset = adjusted_list_scroll_offset(
-            self.list_scroll_offset,
-            delta,
-            self.list_items().len(),
-            visible_h,
-        );
+        let max_scroll = self.list_max_scroll(&self.list_items(), visible_h);
+        self.list_scroll_offset =
+            adjusted_scrollback(self.list_scroll_offset, delta).min(max_scroll);
+    }
+
+    /// A list item's display height under the current view mode: full-mode
+    /// session cards take two rows, everything else (group headers, archived
+    /// disclosure rows, every compact-mode row) takes one.
+    pub(crate) fn list_item_display_height(&self, item: &ListItem) -> usize {
+        match item {
+            ListItem::Session { .. } if self.list_mode == SessionListViewMode::Full => 2,
+            _ => 1,
+        }
+    }
+
+    /// Largest useful `list_scroll_offset`: the smallest offset that still
+    /// fills the viewport down to the last item. Measured in display rows so
+    /// full-mode's two-row cards count double; with uniform one-row items
+    /// this reduces to `len − visible_rows`.
+    pub(crate) fn list_max_scroll(&self, items: &[ListItem], visible_rows: usize) -> usize {
+        let mut rows = 0usize;
+        for (idx, item) in items.iter().enumerate().rev() {
+            rows += self.list_item_display_height(item);
+            if rows > visible_rows {
+                return idx + 1;
+            }
+        }
+        0
     }
 
     pub(crate) fn is_orchestrator_panel_open(&self) -> bool {
@@ -13595,6 +13678,8 @@ mod tests {
             modeline_theme_hit: None,
             list_row_count: 0,
             list_items_area: None,
+            list_visible_rows: Vec::new(),
+            list_mode_toggle_hit: None,
             list_scroll_offset: 0,
             list_scrollbar: None,
             shortcut_hints: Vec::new(),
@@ -13729,6 +13814,7 @@ mod tests {
             window_pane_sizes: HashMap::new(),
             zoom: ZoomMode::None,
             list_scroll_offset: 0,
+            list_mode: SessionListViewMode::Compact,
             view_scrollback: 0,
             window_scrollback: HashMap::new(),
             window_views: HashMap::new(),
@@ -27842,6 +27928,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_mode_list_max_scroll_counts_cards_as_two_rows() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.sessions = (0..10)
+            .map(|index| {
+                let mut session = summary_with_kind(construct_protocol::SessionKind::User);
+                session.id = format!("s{index}");
+                session.position = index;
+                session
+            })
+            .collect();
+        let items = app.list_items();
+        assert_eq!(
+            app.list_max_scroll(&items, 4),
+            6,
+            "compact mode reduces to len − visible_rows"
+        );
+        app.list_mode = SessionListViewMode::Full;
+        // Four rows fit two 2-row cards, so the last page starts at item 8.
+        assert_eq!(app.list_max_scroll(&items, 4), 8);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn full_mode_click_maps_detail_rows_to_their_card() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s1.position = 0;
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
+        s2.id = "s2".into();
+        s2.position = 1;
+        app.sessions = vec![s1, s2];
+        app.selection = Selection::Session("s1".into());
+        app.main_windows = MainWindowTree::single(1, Selection::Session("s1".into()));
+        app.active_window_id = 1;
+        app.list_mode = SessionListViewMode::Full;
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render");
+
+        let items_area = app.layout.list_items_area.expect("list items area");
+        // Each session card spans two display rows: s1 at rows 0-1, s2 at
+        // rows 2-3.
+        assert_eq!(
+            app.layout.list_visible_rows[..4].to_vec(),
+            vec![
+                ListRowHit {
+                    item_index: 0,
+                    first_line: true
+                },
+                ListRowHit {
+                    item_index: 0,
+                    first_line: false
+                },
+                ListRowHit {
+                    item_index: 1,
+                    first_line: true
+                },
+                ListRowHit {
+                    item_index: 1,
+                    first_line: false
+                },
+            ]
+        );
+
+        let click = |col: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        let release = |col: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        // A click on s2's DETAIL line (row 3) selects s2 — under the old 1:1
+        // row mapping it would have landed past the end of the list.
+        let col = items_area.x + items_area.width / 2;
+        app.on_mouse(click(col, items_area.y + 3)).await;
+        app.on_mouse(release(col, items_area.y + 3)).await;
+        assert_eq!(app.selection, Selection::Session("s2".into()));
+
+        // The pin gutter only exists on a card's first line: the same
+        // columns on s1's detail line are a plain row selection, not a pin
+        // toggle.
+        app.on_mouse(click(items_area.x + 2, items_area.y + 1))
+            .await;
+        app.on_mouse(release(items_area.x + 2, items_area.y + 1))
+            .await;
+        assert_eq!(app.selection, Selection::Session("s1".into()));
+        assert!(
+            !app.sessions.iter().any(|s| s.pinned),
+            "a detail-line click must not toggle pinning"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clicking_list_mode_label_toggles_full_rows() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        app.sessions = vec![s1];
+        app.selection = Selection::Session("s1".into());
+        app.main_windows = MainWindowTree::single(1, Selection::Session("s1".into()));
+        app.active_window_id = 1;
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render");
+        let hit = app
+            .layout
+            .list_mode_toggle_hit
+            .expect("mode label rendered on a 40-cell sidebar");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert_eq!(app.list_mode, SessionListViewMode::Full);
+
+        // The next frame renders the session as a two-row card.
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render");
+        assert_eq!(
+            app.layout.list_visible_rows[..2].to_vec(),
+            vec![
+                ListRowHit {
+                    item_index: 0,
+                    first_line: true
+                },
+                ListRowHit {
+                    item_index: 0,
+                    first_line: false
+                },
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn mouse_list_click_swaps_session_already_visible_in_another_split() {
         let (mut app, _dir, server) = captured_app().await;
         let mut second = summary_with_kind(construct_protocol::SessionKind::User);
@@ -37379,16 +37623,6 @@ mod tests {
         assert_eq!(adjusted_scrollback(5, 3), 8);
         assert_eq!(adjusted_scrollback(SCROLLBACK_MAX - 1, 10), SCROLLBACK_MAX);
     }
-
-    #[test]
-    fn adjusted_list_scroll_offset_clamps_to_visible_range() {
-        assert_eq!(adjusted_list_scroll_offset(0, 3, 10, 4), 3);
-        assert_eq!(adjusted_list_scroll_offset(3, -1, 10, 4), 2);
-        assert_eq!(adjusted_list_scroll_offset(0, -99, 10, 4), 0);
-        assert_eq!(adjusted_list_scroll_offset(0, 99, 10, 4), 6);
-        assert_eq!(adjusted_list_scroll_offset(9, 0, 10, 4), 6);
-        assert_eq!(adjusted_list_scroll_offset(2, 1, 3, 4), 0);
-    }
 }
 
 fn adjusted_scrollback(current: usize, delta: i32) -> usize {
@@ -37398,16 +37632,6 @@ fn adjusted_scrollback(current: usize, delta: i32) -> usize {
 fn adjusted_scroll_offset(current: usize, delta: i32, max_scroll: usize) -> usize {
     let next = current as i32 + delta;
     next.max(0).min(max_scroll as i32) as usize
-}
-
-fn adjusted_list_scroll_offset(
-    current: usize,
-    delta: i32,
-    item_count: usize,
-    visible_rows: usize,
-) -> usize {
-    let max_scroll = item_count.saturating_sub(visible_rows);
-    adjusted_scrollback(current, delta).min(max_scroll)
 }
 
 fn json_escape(s: &str) -> String {
