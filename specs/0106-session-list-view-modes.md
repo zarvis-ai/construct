@@ -20,8 +20,9 @@ The session list renders in one of two user-selectable view modes:
 
 Rules both modes must preserve:
 
-- The toggle is a small labeled control on the list pane's border, adjacent to
-  the pane's title, mirroring the lineage section's full/compact pair. The
+- The toggle is a small labeled control on the list pane's border,
+  right-aligned immediately before the pane's collapse control — the same
+  placement and label shape as the lineage section's full/compact toggle. The
   choice persists across launches; legacy state restores to compact.
 - The detail line only ever shows data the session actually reported — absent
   fields are omitted, never rendered as placeholders. A session reporting no

@@ -664,28 +664,31 @@ pub fn list_plus_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
     Some((list_area.x + 1, list_area.x + 3, list_area.y))
 }
 
-/// Label text of the session list's view-mode toggle on the pane's top
-/// border, naming the mode a click switches AWAY from — the surrounding
-/// title already says "sessions", mirroring the lineage header's one-word
-/// mode label.
+/// Label text of the session list's view-mode toggle: the current mode's
+/// one-word name plus a swap glyph, exactly like the lineage header's
+/// ` full ⇄ ` / ` compact ⇄ ` toggle. The surrounding spaces are part of
+/// the click target.
 pub fn list_mode_button_label(mode: crate::app::SessionListViewMode) -> String {
-    format!("· {}", mode.short_label())
+    format!(" {} \u{21c4} ", mode.short_label())
 }
 
 /// Hit zone for the view-mode toggle label on the session list's top
-/// border, right of the ` + sessions ` title. Returns
+/// border: right-aligned immediately left of the `«` collapse button,
+/// mirroring the lineage header's layout. Returns
 /// `(x_start, x_end_exclusive, y)`, or `None` when the pane is too narrow
-/// to fit the label with a gap before the `«` collapse button.
+/// to fit the label after the ` + sessions ` title.
 pub fn list_mode_button_range(
     list_area: Rect,
     mode: crate::app::SessionListViewMode,
 ) -> Option<(u16, u16, u16)> {
-    // The title renders from `list_area.x + 1`; ` + sessions ` is 12 cells.
-    let x_start = list_area.x.saturating_add(13);
     let label_w = UnicodeWidthStr::width(list_mode_button_label(mode).as_str()) as u16;
-    let x_end = x_start.saturating_add(label_w);
-    let collapse_start = list_area.x + list_area.width.saturating_sub(4);
-    if x_end.saturating_add(1) > collapse_start {
+    // The ` « ` collapse button occupies the 3 cells before the corner
+    // (`list_collapse_button_range`); the label ends flush against it.
+    let x_end = list_area.x + list_area.width.saturating_sub(4);
+    let x_start = x_end.saturating_sub(label_w);
+    // The left title ` + sessions ` renders from `x + 1` through `x + 12`;
+    // keep a one-cell gap so the two never collide.
+    if x_start <= list_area.x.saturating_add(13) {
         return None;
     }
     Some((x_start, x_end, list_area.y))
@@ -2161,14 +2164,20 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
         clear_pane_side_borders(f, area, app);
         return;
     }
-    // Expanded render path: title is ` + sessions ` followed by the
-    // view-mode toggle label (`· compact` / `· full`), with a
-    // right-aligned ` « ` for collapse. All are clickable; the
-    // click handler in `App::click_list` consults
-    // `list_title_button_hit` / `list_mode_toggle_hit` for the geometry.
+    // Expanded render path: title is ` + sessions ` at the left; at the
+    // right sit the view-mode toggle label (` compact ⇄ ` / ` full ⇄ `)
+    // and the ` « ` collapse button — the same right-aligned pairing as
+    // the lineage section header. All are clickable; the click handler in
+    // `App::click_list` consults `list_title_button_hit` /
+    // `list_mode_toggle_hit` for the geometry.
     let plus_style = Style::default()
         .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
+    let title_line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("+", plus_style),
+        Span::raw(" sessions "),
+    ]);
     let mode_range = list_mode_button_range(area, app.list_mode);
     let mode_hovered = match (app.mouse_pos, mode_range) {
         (Some((mx, my)), Some((xs, xe, y))) => my == y && mx >= xs && mx < xe,
@@ -2181,25 +2190,12 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Style::default().fg(app.theme.muted)
     };
-    let mut title_spans = vec![
-        Span::raw(" "),
-        Span::styled("+", plus_style),
-        Span::raw(" sessions "),
-    ];
-    if mode_range.is_some() {
-        title_spans.push(Span::styled(
-            list_mode_button_label(app.list_mode),
-            mode_style,
-        ));
-        title_spans.push(Span::raw(" "));
-    }
     app.layout.list_mode_toggle_hit = mode_range.map(|(xs, xe, y)| Rect {
         x: xs,
         y,
         width: xe.saturating_sub(xs),
         height: 1,
     });
-    let title_line = Line::from(title_spans);
     let minus_hovered = match app.mouse_pos {
         Some((mx, my)) => list_collapse_button_range(area)
             .map(|(xs, xe, y)| my == y && mx >= xs && mx < xe)
@@ -2213,8 +2209,16 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Style::default().fg(app.theme.muted)
     };
+    let mut collapse_spans = Vec::new();
+    if mode_range.is_some() {
+        collapse_spans.push(Span::styled(
+            list_mode_button_label(app.list_mode),
+            mode_style,
+        ));
+    }
+    collapse_spans.push(Span::styled(" « ", minus_style));
     let collapse_line =
-        Line::from(Span::styled(" « ", minus_style)).alignment(ratatui::layout::Alignment::Right);
+        Line::from(collapse_spans).alignment(ratatui::layout::Alignment::Right);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border_style(&app.theme, focused))
@@ -18187,15 +18191,18 @@ mod tests {
     }
 
     #[test]
-    fn list_mode_button_sits_after_title_and_hides_when_narrow() {
+    fn list_mode_button_right_aligns_before_collapse_and_hides_when_narrow() {
         let list = Rect::new(0, 0, 40, 20);
         let (xs, xe, y) = list_mode_button_range(list, crate::app::SessionListViewMode::Compact)
             .expect("wide pane fits the label");
         assert_eq!(y, list.y);
-        assert_eq!(xs, list.x + 13);
-        // "· compact" is 9 cells.
-        assert_eq!(xe, xs + 9);
-        // Too narrow to fit before the `−` collapse button → no label at all.
+        // The label ends flush against the ` « ` collapse button (which
+        // occupies the 3 cells before the corner), like the lineage header.
+        let (collapse_xs, _, _) = list_collapse_button_range(list).expect("collapse button");
+        assert_eq!(xe, collapse_xs);
+        // ` compact ⇄ ` is 11 cells.
+        assert_eq!(xs, xe - 11);
+        // Too narrow to clear the ` + sessions ` title → no label at all.
         assert_eq!(
             list_mode_button_range(
                 Rect::new(0, 0, 26, 20),
