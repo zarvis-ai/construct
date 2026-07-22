@@ -38,6 +38,11 @@ Rules both modes must preserve:
   context gauge longest. Full mode never forces the sidebar wider and never
   horizontally scrolls.
 - Group headers and archived-disclosure rows stay one line in both modes.
+- The web UI's session list shows the same detail line with the same
+  content and omission/fallback rules, but always on — it has no
+  compact/full mode pair. Its gauge may render at finer resolution than
+  the TUI's cell bar (a continuous fill), since the constraint being
+  mirrored is the information and its semantics, not the glyphs.
 - Selection, keyboard navigation, and scrolling operate on items, not display
   rows; a click anywhere within a card selects it, while gutter affordances
   (disclosure triangle, pin target) live on the card's first line only.
@@ -67,5 +72,5 @@ lineage section set for a full/compact pair.
 
 - No third, denser-still or taller-still mode; two modes keep the toggle a
   binary.
-- The web UI's session list is out of scope; this decision covers the TUI.
+- A web-UI mode switch: the web list always shows the detail line.
 - The detail line is a summary, not a control surface — it hosts no buttons.

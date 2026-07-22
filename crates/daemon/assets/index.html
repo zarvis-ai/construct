@@ -376,6 +376,61 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* Two-line card (TUI full-mode parity): the item is a column of the
+     original title row plus a detail row (model·effort, context gauge,
+     activity, tokens). A dedicated `.title-row` wrapper keeps the title line's
+     flex behavior (name truncates, harness stays right-aligned) instead
+     of `flex-wrap`, which would push trailing cells onto the next line
+     rather than shrinking the name. The detail row's left margin tucks
+     it beneath the name (past the disclosure + status gutter), and the
+     depth ladder's item padding indents it with the rest of the row. */
+  .session-list .item { flex-direction: column; align-items: stretch; }
+  .session-list .item .title-row {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+  }
+  .session-list .item .detail {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 36px;
+    margin-top: 2px;
+    min-width: 0;
+    color: var(--fg-faint);
+    font-size: 11px;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .session-list .item .detail > span { flex: none; }
+  /* The trailing tokens segment is least important: it alone shrinks
+     (to nothing, past its ellipsis) when the sidebar is narrow, so the
+     activity text keeps its full width — mirroring the TUI's drop
+     order, where tokens vanish before activity/model/gauge. */
+  .session-list .item .detail .detail-tokens {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .session-list .item .detail .ctx-gauge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .session-list .item .detail .ctx-bar {
+    width: 26px;
+    height: 4px;
+    border-radius: 2px;
+    background: color-mix(in srgb, var(--fg-faint) 25%, transparent);
+    overflow: hidden;
+  }
+  .session-list .item .detail .ctx-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: var(--accent);
+  }
   .session-list .item .state {
     flex: 0 0 16px;
     text-align: center;
@@ -3894,6 +3949,7 @@ function refreshSessionListActivityGlyphs(now = Date.now()) {
 
 function refreshSessionActivityGlyphs(now = Date.now()) {
   refreshSessionListActivityGlyphs(now);
+  refreshSessionListDetailLive(now);
   refreshProgramSessionClipGlyphs(now);
 }
 
@@ -4204,9 +4260,11 @@ function sessionRowDescriptor(item) {
       datasetVal: s.id,
       className: "item is-operator" + active,
       inner:
+        `<div class="title-row">` +
         `<span class="disclosure"></span>` +
         sessionStatusHtml(s) +
-        `<div class="name">operator</div>`,
+        `<div class="name">operator</div>` +
+        `</div>`,
     };
   }
   // Gutter cell: the children-disclosure triangle when the session has
@@ -4239,9 +4297,12 @@ function sessionRowDescriptor(item) {
       (s.pinned ? " is-pinned" : "") +
       (s.archived ? " is-archived" : ""),
     inner:
+      `<div class="title-row">` +
       disclosure + sessionStatusHtml(s) +
       `<div class="name">${escape(sessionDisplayTitle(s))}</div>` +
-      markers + harness,
+      markers + harness +
+      `</div>` +
+      sessionDetailHtml(s),
   };
 }
 
@@ -11139,6 +11200,106 @@ function sessionHarnessLabel(s) {
 function sessionDisplayTitle(s) {
   if (!s) return "";
   return s.title || sessionHarnessLabel(s) || s.id.slice(0, 8);
+}
+
+/* Session-list detail row (TUI full-mode parity, spec 0106): model·effort,
+   context gauge, activity, tokens — always on (the web list has no
+   compact/full switch). Absent data is omitted; a session reporting
+   nothing falls back to where it lives. Cost is deliberately excluded. */
+
+/** `950`, `4.2k`, `87k`, `1.3M` — mirrors the TUI's token formatter. */
+function formatTokenCount(n) {
+  if (n >= 10_000_000) return `${Math.floor(n / 1_000_000)}M`;
+  if (n >= 1_000_000) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.floor(n / 1_000)}k`;
+  if (n >= 1_000) return `${(n / 1e3).toFixed(1)}k`;
+  return String(n);
+}
+
+/** `3s`, `12m34s` — mirrors the TUI's busy-duration label. */
+function formatDurationMs(ms) {
+  const secs = Math.floor(Math.max(0, ms) / 1000);
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return m > 0 ? `${m}m${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+
+/** Coarse single-unit age: `42s`, `12m`, `3h`, `2d`. */
+function formatAgeMs(ms) {
+  const secs = Math.floor(Math.max(0, ms) / 1000);
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86_400) return `${Math.floor(secs / 3600)}h`;
+  return `${Math.floor(secs / 86_400)}d`;
+}
+
+/** `claude-haiku-4-5-20251001` → `haiku-4-5` — drops the vendor prefix
+ *  and a trailing 8-digit date stamp, like the TUI's short model label. */
+function shortModelLabel(model) {
+  let base = model.startsWith("claude-") ? model.slice(7) : model;
+  const cut = base.lastIndexOf("-");
+  if (cut > 0 && /^\d{8}$/.test(base.slice(cut + 1))) base = base.slice(0, cut);
+  return base;
+}
+
+/** The live activity segment: ticking busy time while running, coarse
+ *  age since the last chat message otherwise (falling back to the last
+ *  recorded event for message-less sessions — same semantics as the
+ *  TUI, so restart/status noise doesn't reset the age). */
+function sessionDetailLiveText(s, now = Date.now()) {
+  if ((s.state || "").toLowerCase() === "running") {
+    const since = s.busy_running_since_ms || now;
+    return `busy ${formatDurationMs(now - since)}`;
+  }
+  const at = s.last_message_at || s.last_event_at;
+  if (!at) return "";
+  const ms = now - new Date(at).getTime();
+  return Number.isFinite(ms) ? `${formatAgeMs(ms)} ago` : "";
+}
+
+function sessionDetailHtml(s) {
+  const parts = [];
+  if (s.model) {
+    const label = shortModelLabel(s.model) + (s.effort ? `·${s.effort}` : "");
+    parts.push(`<span class="detail-model">${escape(label)}</span>`);
+  }
+  const window = s.context_window || 0;
+  if (s.context_used != null && window > 0) {
+    const pct = Math.min(100, Math.round((s.context_used * 100) / window));
+    parts.push(
+      `<span class="ctx-gauge" title="context: ${attr(formatTokenCount(s.context_used))}/${attr(formatTokenCount(window))} tokens">` +
+        `<span class="ctx-bar"><span class="ctx-fill" style="width:${pct}%"></span></span>${pct}%</span>`,
+    );
+  } else if (s.context_used != null) {
+    parts.push(`<span class="ctx-gauge">${escape(formatTokenCount(s.context_used))} ctx</span>`);
+  }
+  const live = sessionDetailLiveText(s);
+  // Always emit the live span (even empty) so the activity ticker has a
+  // stable element to refresh without re-rendering the row.
+  parts.push(`<span class="detail-live" data-session-id="${attr(s.id)}">${escape(live)}</span>`);
+  const tokens = s.tokens ? (s.tokens.input || 0) + (s.tokens.output || 0) : 0;
+  if (tokens > 0) {
+    parts.push(`<span class="detail-tokens">${escape(formatTokenCount(tokens))} tok</span>`);
+  }
+  if (!s.model && s.context_used == null && tokens === 0 && !live) {
+    const dir = s.worktree || s.cwd || "";
+    const tail = dir.split("/").filter(Boolean).pop() || dir;
+    if (tail) parts.push(`<span class="detail-dir">${escape(tail)}</span>`);
+  }
+  return `<div class="detail">${parts.join("")}</div>`;
+}
+
+/** Per-tick refresh of the detail rows' busy/age text — piggybacks on
+ *  the status-glyph ticker so busy timers count up between events. */
+function refreshSessionListDetailLive(now = Date.now()) {
+  if (!sessionListEl) return;
+  const byId = new Map(state.sessions.map((s) => [s.id, s]));
+  for (const el of sessionListEl.querySelectorAll(".detail-live[data-session-id]")) {
+    const s = byId.get(el.dataset.sessionId);
+    if (!s) continue;
+    const text = sessionDetailLiveText(s, now);
+    if (el.textContent !== text) el.textContent = text;
+  }
 }
 
 function sessionViewTitle(s) {
