@@ -1982,8 +1982,8 @@ fn session_list_secondary_style(theme: &Theme) -> Style {
 }
 
 /// The muted second row of a full-mode session card, aligned under the
-/// name: model·effort, context gauge, activity, tokens, cost — dropping
-/// the least important segments first when the pane is narrow.
+/// name: model·effort, context gauge, activity, tokens — dropping the
+/// least important segments first when the pane is narrow.
 fn session_detail_line(
     app: &App,
     s: &SessionSummary,
@@ -2008,8 +2008,8 @@ fn session_detail_line(
 
 /// `(text, keep-priority)` segments of a full-mode detail line, in display
 /// order. Higher priority survives a narrow pane longer: the context gauge
-/// ("how full is it") outranks the model, which outranks activity, tokens,
-/// and cost. Absent data is omitted rather than shown as placeholders; a
+/// ("how full is it") outranks the model, which outranks activity and
+/// tokens. Absent data is omitted rather than shown as placeholders; a
 /// session reporting nothing at all (e.g. a plain shell) falls back to
 /// where it lives.
 fn session_detail_segments(s: &SessionSummary, now_ms: i64) -> Vec<(String, u8)> {
@@ -2056,9 +2056,6 @@ fn session_detail_segments(s: &SessionSummary, now_ms: i64) -> Vec<(String, u8)>
             1,
         ));
     }
-    if let Some(cost) = s.cost_usd {
-        segs.push((format!("${cost:.2}"), 0));
-    }
     if segs.is_empty() {
         let dir = s.worktree.as_deref().unwrap_or(&s.cwd);
         let tail = std::path::Path::new(dir)
@@ -2097,9 +2094,11 @@ fn fit_detail_segments(mut segs: Vec<(String, u8)>, avail: usize) -> String {
 }
 
 /// Four-cell context-window gauge plus percentage, e.g. `▰▰▱▱ 52%`.
+/// Fill rounds to the NEAREST quarter so the bar tracks the percentage —
+/// 54% reads as two cells (just over half), not three as ceiling would give.
 fn context_gauge_label(used: u64, window: u64) -> String {
     let pct = used.saturating_mul(100) / window;
-    let filled = (used.min(window).saturating_mul(4).div_ceil(window) as usize).min(4);
+    let filled = ((used.min(window).saturating_mul(4) + window / 2) / window) as usize;
     let mut bar = String::new();
     for i in 0..4 {
         bar.push(if i < filled { '▰' } else { '▱' });
@@ -18102,7 +18101,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_segments_show_model_gauge_activity_tokens_and_cost() {
+    fn detail_segments_show_model_gauge_activity_and_tokens() {
         let mut s = lineage_test_summary("s1");
         s.model = Some("claude-opus-4-8".into());
         s.effort = Some("high".into());
@@ -18114,24 +18113,21 @@ mod tests {
             output: 13_000,
             cached: 0,
         };
+        // Cost is deliberately NOT part of the detail line, even when the
+        // session reports one.
         s.cost_usd = Some(1.42);
         let segs = session_detail_segments(&s, 61_000);
         let texts: Vec<&str> = segs.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(
             texts,
-            vec![
-                "opus-4-8\u{00b7}high",
-                "▰▰▱▱ 50%",
-                "busy 1m00s",
-                "213k tok",
-                "$1.42"
-            ]
+            vec!["opus-4-8\u{00b7}high", "▰▰▱▱ 50%", "busy 1m00s", "213k tok"]
         );
-        // The gauge outlives everything else on a narrow pane; cost drops
+        // The gauge outlives everything else on a narrow pane; tokens drop
         // first.
         let gauge_priority = segs.iter().map(|(_, p)| *p).max().unwrap();
         assert_eq!(segs[1].1, gauge_priority);
-        assert_eq!(segs.last().unwrap().1, 0);
+        let min_priority = segs.iter().map(|(_, p)| *p).min().unwrap();
+        assert_eq!(segs.last().unwrap().1, min_priority);
     }
 
     #[test]
@@ -18182,12 +18178,15 @@ mod tests {
     }
 
     #[test]
-    fn context_gauge_label_fills_four_cells() {
+    fn context_gauge_fill_rounds_to_nearest_quarter() {
         assert_eq!(context_gauge_label(50_000, 200_000), "▰▱▱▱ 25%");
         assert_eq!(context_gauge_label(200_000, 200_000), "▰▰▰▰ 100%");
-        // Any nonzero use lights the first cell (div_ceil), matching the
-        // "something is in there" reading.
-        assert_eq!(context_gauge_label(1, 200_000), "▰▱▱▱ 0%");
+        // Just over half fills two cells, not three — the bar tracks the
+        // percentage instead of ceiling up.
+        assert_eq!(context_gauge_label(54_000, 100_000), "▰▰▱▱ 54%");
+        // ...and rounds up only past the midpoint of a quarter.
+        assert_eq!(context_gauge_label(63_000, 100_000), "▰▰▰▱ 63%");
+        assert_eq!(context_gauge_label(1, 200_000), "▱▱▱▱ 0%");
     }
 
     #[test]

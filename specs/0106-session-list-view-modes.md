@@ -15,8 +15,10 @@ The session list renders in one of two user-selectable view modes:
 - **Full**: the compact line plus a muted second detail line aligned under the
   name, showing (in display order) the model and reasoning effort, a small
   context-window gauge with percentage, current activity (live busy time while
-  running, coarse age since last activity otherwise), lifetime token volume,
-  and cost.
+  running, coarse age since last activity otherwise), and lifetime token
+  volume. Cost is deliberately excluded. The gauge's fill rounds to the
+  nearest step so the bar tracks the percentage (just over half reads as
+  half, not three quarters).
 
 Rules both modes must preserve:
 
@@ -29,9 +31,9 @@ Rules both modes must preserve:
   model/usage data at all (e.g. a plain shell) falls back to showing where it
   lives (its worktree or working directory).
 - On a narrow sidebar the detail line drops segments rather than wrapping,
-  least important first: cost, then tokens, then activity, then model, keeping
-  the context gauge longest. Full mode never forces the sidebar wider and
-  never horizontally scrolls.
+  least important first: tokens, then activity, then model, keeping the
+  context gauge longest. Full mode never forces the sidebar wider and never
+  horizontally scrolls.
 - Group headers and archived-disclosure rows stay one line in both modes.
 - Selection, keyboard navigation, and scrolling operate on items, not display
   rows; a click anywhere within a card selects it, while gutter affordances
