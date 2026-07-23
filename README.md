@@ -5,7 +5,6 @@
     <a href="https://github.com/construct-worlds/construct/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/construct-worlds/construct/ci.yml?branch=main" alt="ci status"></a>
     <a href="https://github.com/construct-worlds/construct/releases"><img src="https://img.shields.io/github/v/release/construct-worlds/construct" alt="latest release"></a>
     <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/built_with-rust-dea584?logo=rust&logoColor=white" alt="built with rust"></a>
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/construct-worlds/construct" alt="license"></a>
     <a href="https://discord.gg/89fPgTKsRF"><img src="https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white" alt="join the construct discord"></a>
   </p>
   <img src="https://raw.githubusercontent.com/construct-worlds/construct/52849f56c902397d6729ec286293064c5b15bcfe/demos/lineage-program-run.gif" alt="construct lineage and program run">
