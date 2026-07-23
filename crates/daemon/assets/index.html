@@ -390,10 +390,18 @@
     align-items: center;
     min-width: 0;
   }
+  /* Detail cells sit in FIXED-width columns (only the identity cell
+     flexes), so the same field lands at the same x on every row and the
+     list scans vertically — spec 0106's columnized layout. Empty cells
+     hold a dim ─ placeholder instead of collapsing, so a column's
+     position always means the same field. Values render one step
+     brighter than units/placeholders; live busy time uses the running
+     color. Narrow sidebars drop whole columns right-to-left via
+     container queries, mirroring the TUI's drop order. */
   .session-list .item .detail {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 5px;
     margin-left: 36px;
     margin-top: 2px;
     min-width: 0;
@@ -402,25 +410,38 @@
     line-height: 1.2;
     white-space: nowrap;
     overflow: hidden;
+    container-type: inline-size;
   }
-  .session-list .item .detail > span { flex: none; }
-  /* The trailing tokens segment is least important: it alone shrinks
-     (to nothing, past its ellipsis) when the sidebar is narrow, so the
-     activity text keeps its full width — mirroring the TUI's drop
-     order, where tokens vanish before activity/model/gauge. */
-  .session-list .item .detail .detail-tokens {
-    flex: 0 1 auto;
+  .session-list .item .detail .d-model {
+    flex: 1 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+    color: var(--fg-dim);
   }
-  .session-list .item .detail .ctx-gauge {
+  .session-list .item .detail .d-ctx {
+    flex: none;
+    width: 50px;
     display: inline-flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 4px;
   }
+  .session-list .item .detail .d-live {
+    flex: none;
+    width: 46px;
+    text-align: right;
+  }
+  .session-list .item .detail .d-live.is-busy { color: var(--ok); }
+  .session-list .item .detail .d-tok {
+    flex: none;
+    width: 46px;
+    text-align: right;
+  }
+  .session-list .item .detail .d-val { color: var(--fg-dim); font-style: normal; }
   .session-list .item .detail .ctx-bar {
-    width: 26px;
+    flex: none;
+    width: 20px;
     height: 4px;
     border-radius: 2px;
     background: color-mix(in srgb, var(--fg-faint) 25%, transparent);
@@ -430,6 +451,12 @@
     height: 100%;
     border-radius: 2px;
     background: var(--accent);
+  }
+  @container (max-width: 225px) {
+    .session-list .item .detail .d-tok { display: none; }
+  }
+  @container (max-width: 150px) {
+    .session-list .item .detail .d-live { display: none; }
   }
   .session-list .item .state {
     flex: 0 0 16px;
@@ -11242,51 +11269,85 @@ function shortModelLabel(model) {
   return base;
 }
 
-/** The live activity segment: ticking busy time while running, coarse
- *  age since the last chat message otherwise (falling back to the last
- *  recorded event for message-less sessions — same semantics as the
- *  TUI, so restart/status noise doesn't reset the age). */
-function sessionDetailLiveText(s, now = Date.now()) {
-  if ((s.state || "").toLowerCase() === "running") {
-    const since = s.busy_running_since_ms || now;
-    return `busy ${formatDurationMs(now - since)}`;
-  }
-  const at = s.last_message_at || s.last_event_at;
-  if (!at) return "";
-  const ms = now - new Date(at).getTime();
-  return Number.isFinite(ms) ? `${formatAgeMs(ms)} ago` : "";
+/** Busy-time label: always the coarse single-unit scale (`54s`, `12m`,
+ *  `2h`) — the web list's fixed activity column is too narrow for
+ *  `1m45s`-style precision, and a long-lived busy session must never
+ *  balloon into `2579m57s`. */
+function formatBusyMs(ms) {
+  return formatAgeMs(ms);
 }
 
-function sessionDetailHtml(s) {
-  const parts = [];
-  if (s.model) {
-    const label = shortModelLabel(s.model) + (s.effort ? `·${s.effort}` : "");
-    parts.push(`<span class="detail-model">${escape(label)}</span>`);
+/** The live activity cell: ticking busy time while running, coarse age
+ *  since the last chat message otherwise (falling back to the last
+ *  recorded event for message-less sessions — same semantics as the
+ *  TUI, so restart/status noise doesn't reset the age). Returns
+ *  `{text, busy}`; empty text means "no activity known". */
+function sessionDetailLive(s, now = Date.now()) {
+  if ((s.state || "").toLowerCase() === "running") {
+    const since = s.busy_running_since_ms || now;
+    return { text: `busy ${formatBusyMs(now - since)}`, busy: true };
   }
+  const at = s.last_message_at || s.last_event_at;
+  if (!at) return { text: "", busy: false };
+  const ms = now - new Date(at).getTime();
+  return { text: Number.isFinite(ms) ? `${formatAgeMs(ms)} ago` : "", busy: false };
+}
+
+/** Dim placeholder that holds an empty detail column open, so a
+ *  column's position means the same field on every row. */
+const DETAIL_EMPTY = "─";
+
+function sessionDetailHtml(s) {
+  // Identity cell: model·effort, or where the session lives when it
+  // reports no model (a plain shell). The only flexing cell.
+  let identity;
+  if (s.model) {
+    identity = shortModelLabel(s.model) + (s.effort ? `·${s.effort}` : "");
+  } else {
+    const dir = s.worktree || s.cwd || "";
+    identity = dir.split("/").filter(Boolean).pop() || dir;
+  }
+  const parts = [`<span class="d-model">${escape(identity)}</span>`];
   const window = s.context_window || 0;
   if (s.context_used != null && window > 0) {
     const pct = Math.min(100, Math.round((s.context_used * 100) / window));
     parts.push(
-      `<span class="ctx-gauge" title="context: ${attr(formatTokenCount(s.context_used))}/${attr(formatTokenCount(window))} tokens">` +
-        `<span class="ctx-bar"><span class="ctx-fill" style="width:${pct}%"></span></span>${pct}%</span>`,
+      `<span class="d-ctx" title="context: ${attr(formatTokenCount(s.context_used))}/${attr(formatTokenCount(window))} tokens">` +
+        `<span class="ctx-bar"><span class="ctx-fill" style="width:${pct}%"></span></span><i class="d-val">${pct}%</i></span>`,
     );
   } else if (s.context_used != null) {
-    parts.push(`<span class="ctx-gauge">${escape(formatTokenCount(s.context_used))} ctx</span>`);
+    parts.push(
+      `<span class="d-ctx"><i class="d-val">${escape(formatTokenCount(s.context_used))}</i>&nbsp;ctx</span>`,
+    );
+  } else {
+    parts.push(`<span class="d-ctx">${DETAIL_EMPTY}</span>`);
   }
-  const live = sessionDetailLiveText(s);
-  // Always emit the live span (even empty) so the activity ticker has a
-  // stable element to refresh without re-rendering the row.
-  parts.push(`<span class="detail-live" data-session-id="${attr(s.id)}">${escape(live)}</span>`);
+  const live = sessionDetailLive(s);
+  // The live cell always exists (placeholder when empty) so the activity
+  // ticker has a stable element to refresh without re-rendering the row.
+  parts.push(
+    `<span class="d-live${live.busy ? " is-busy" : ""}" data-session-id="${attr(s.id)}">${escape(live.text) || DETAIL_EMPTY}</span>`,
+  );
   const tokens = s.tokens ? (s.tokens.input || 0) + (s.tokens.output || 0) : 0;
-  if (tokens > 0) {
-    parts.push(`<span class="detail-tokens">${escape(formatTokenCount(tokens))} tok</span>`);
-  }
-  if (!s.model && s.context_used == null && tokens === 0 && !live) {
-    const dir = s.worktree || s.cwd || "";
-    const tail = dir.split("/").filter(Boolean).pop() || dir;
-    if (tail) parts.push(`<span class="detail-dir">${escape(tail)}</span>`);
-  }
-  return `<div class="detail">${parts.join("")}</div>`;
+  parts.push(
+    tokens > 0
+      ? `<span class="d-tok"><i class="d-val">${escape(formatTokenCount(tokens))}</i>&nbsp;tok</span>`
+      : `<span class="d-tok">${DETAIL_EMPTY}</span>`,
+  );
+  // Hover reveals everything, including columns a narrow sidebar dropped.
+  const summary = [
+    identity,
+    s.context_used != null && window > 0
+      ? `context ${formatTokenCount(s.context_used)}/${formatTokenCount(window)}`
+      : s.context_used != null
+        ? `context ${formatTokenCount(s.context_used)}`
+        : "",
+    live.text,
+    tokens > 0 ? `${formatTokenCount(tokens)} tokens` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return `<div class="detail" title="${attr(summary)}">${parts.join("")}</div>`;
 }
 
 /** Per-tick refresh of the detail rows' busy/age text — piggybacks on
@@ -11294,11 +11355,13 @@ function sessionDetailHtml(s) {
 function refreshSessionListDetailLive(now = Date.now()) {
   if (!sessionListEl) return;
   const byId = new Map(state.sessions.map((s) => [s.id, s]));
-  for (const el of sessionListEl.querySelectorAll(".detail-live[data-session-id]")) {
+  for (const el of sessionListEl.querySelectorAll(".d-live[data-session-id]")) {
     const s = byId.get(el.dataset.sessionId);
     if (!s) continue;
-    const text = sessionDetailLiveText(s, now);
+    const live = sessionDetailLive(s, now);
+    const text = live.text || DETAIL_EMPTY;
     if (el.textContent !== text) el.textContent = text;
+    el.classList.toggle("is-busy", live.busy);
   }
 }
 

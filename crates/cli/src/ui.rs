@@ -1981,134 +1981,293 @@ fn session_list_secondary_style(theme: &Theme) -> Style {
     Style::default().fg(theme.muted)
 }
 
-/// The muted second row of a full-mode session card, aligned under the
-/// name: model·effort, context gauge, activity, tokens — dropping the
-/// least important segments first when the pane is narrow.
-fn session_detail_line(
-    app: &App,
-    s: &SessionSummary,
-    prefix_w: usize,
-    row_w: usize,
-) -> Line<'static> {
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let avail = row_w.saturating_sub(prefix_w);
-    let text = fit_detail_segments(session_detail_segments(s, now_ms), avail);
-    let style = if s.archived {
-        Style::default()
-            .fg(app.theme.dim)
-            .add_modifier(Modifier::DIM)
-    } else {
-        session_list_secondary_style(&app.theme)
-    };
-    Line::from(vec![
-        Span::raw(" ".repeat(prefix_w)),
-        Span::styled(text, style),
-    ])
+/// Ceiling on the detail line's model column, so one verbose model id
+/// (`codex-oauth:gpt-5.6-sol`) can't push every other column off a
+/// narrow sidebar.
+const DETAIL_MODEL_W_MAX: usize = 20;
+/// Dim placeholder holding an empty detail column open, so a column's
+/// position means the same field on every row.
+const DETAIL_EMPTY: &str = "\u{2500}";
+/// Cells of the gauge variant of the context column: 4 bar cells, a
+/// space, and a right-aligned percentage up to `100%`.
+const DETAIL_GAUGE_W: usize = 9;
+
+/// One session's detail-line cells, before column layout.
+struct DetailCells {
+    /// Identity column: model·effort, or where the session lives when it
+    /// reports no model (a plain shell).
+    model: String,
+    ctx: DetailCtx,
+    /// Activity text plus whether it is live compute (styled as running).
+    activity: Option<(String, bool)>,
+    tokens: Option<String>,
 }
 
-/// `(text, keep-priority)` segments of a full-mode detail line, in display
-/// order. Higher priority survives a narrow pane longer: the context gauge
-/// ("how full is it") outranks the model, which outranks activity and
-/// tokens. Absent data is omitted rather than shown as placeholders; a
-/// session reporting nothing at all (e.g. a plain shell) falls back to
-/// where it lives.
-fn session_detail_segments(s: &SessionSummary, now_ms: i64) -> Vec<(String, u8)> {
-    let mut segs: Vec<(String, u8)> = Vec::new();
-    if let Some(model) = s.model.as_deref() {
-        let mut label = short_model_label(model);
-        if let Some(effort) = s.effort.as_deref() {
-            label = format!("{label}\u{00b7}{effort}");
+enum DetailCtx {
+    /// `(filled cells 0..=4, percent)` — both clamped to full/100, since a
+    /// harness can report pre-compaction usage above its inferred window.
+    Gauge(usize, u64),
+    /// Bare usage without a known window, e.g. `153k ctx`.
+    Text(String),
+    None,
+}
+
+/// Gauge fill for `used` of `window`: `(filled cells, percent)`, fill
+/// rounded to the NEAREST quarter so the bar tracks the percentage —
+/// 54% reads as two cells, not ceiling's three — and both clamped so
+/// over-window reports (stale usage across a window change) cap at full.
+fn context_gauge_fill(used: u64, window: u64) -> (usize, u64) {
+    let pct = (used.saturating_mul(100) / window).min(100);
+    let filled = ((used.min(window).saturating_mul(4) + window / 2) / window) as usize;
+    (filled, pct)
+}
+
+fn session_detail_cells(s: &SessionSummary, now_ms: i64) -> DetailCells {
+    let model = match s.model.as_deref() {
+        Some(model) => {
+            let mut label = short_model_label(model);
+            if let Some(effort) = s.effort.as_deref() {
+                label = format!("{label}\u{00b7}{effort}");
+            }
+            label
         }
-        segs.push((label, 3));
-    }
-    match (s.context_used, s.context_window.filter(|w| *w > 0)) {
-        (Some(used), Some(window)) => segs.push((context_gauge_label(used, window), 4)),
-        (Some(used), None) => segs.push((
-            format!("{} ctx", crate::lineage::format_token_count(used)),
-            4,
-        )),
-        _ => {}
-    }
-    if s.state == SessionState::Running {
+        None => {
+            let dir = s.worktree.as_deref().unwrap_or(&s.cwd);
+            std::path::Path::new(dir)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(dir)
+                .to_string()
+        }
+    };
+    let ctx = match (s.context_used, s.context_window.filter(|w| *w > 0)) {
+        (Some(used), Some(window)) => {
+            let (filled, pct) = context_gauge_fill(used, window);
+            DetailCtx::Gauge(filled, pct)
+        }
+        (Some(used), None) => {
+            DetailCtx::Text(format!("{} ctx", crate::lineage::format_token_count(used)))
+        }
+        _ => DetailCtx::None,
+    };
+    let activity = if s.state == SessionState::Running {
         let since = s.busy_running_since_ms.unwrap_or(now_ms);
-        segs.push((
+        Some((
             format!(
                 "busy {}",
-                crate::lineage::format_duration_ms(now_ms.saturating_sub(since).max(0) as u64)
+                format_busy_ms(now_ms.saturating_sub(since).max(0) as u64)
             ),
-            2,
-        ));
-    } else if let Some(at) = s.last_message_at.or(s.last_event_at) {
+            true,
+        ))
+    } else {
         // Prefer the last actual chat message so the age means "since the
         // conversation last moved" — `last_event_at` also refreshes on
         // status rows, tool blocks, and daemon-restart resume plumbing.
-        // Sessions with no messages at all (plain shells) fall back to the
-        // last recorded event.
-        segs.push((
-            format!(
-                "{} ago",
-                format_age_ms(now_ms.saturating_sub(at.timestamp_millis()).max(0) as u64)
-            ),
-            2,
-        ));
-    }
-    if !s.tokens.is_zero() {
-        segs.push((
-            format!(
-                "{} tok",
-                crate::lineage::format_token_count(s.tokens.total())
-            ),
-            1,
-        ));
-    }
-    if segs.is_empty() {
-        let dir = s.worktree.as_deref().unwrap_or(&s.cwd);
-        let tail = std::path::Path::new(dir)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(dir);
-        segs.push((tail.to_string(), 0));
-    }
-    segs
-}
-
-/// Join segments with two-space gaps, dropping the lowest-priority
-/// segment until the line fits `avail` cells. A single over-wide
-/// survivor is ellipsized instead of overflowing.
-fn fit_detail_segments(mut segs: Vec<(String, u8)>, avail: usize) -> String {
-    loop {
-        let text = segs
-            .iter()
-            .map(|(t, _)| t.as_str())
-            .collect::<Vec<_>>()
-            .join("  ");
-        if UnicodeWidthStr::width(text.as_str()) <= avail {
-            return text;
-        }
-        if segs.len() <= 1 {
-            return fit_name(&text, avail, None);
-        }
-        let drop = segs
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, (_, p))| *p)
-            .map(|(i, _)| i)
-            .expect("segs is non-empty");
-        segs.remove(drop);
+        // Sessions with no messages at all fall back to the last event.
+        s.last_message_at.or(s.last_event_at).map(|at| {
+            (
+                format!(
+                    "{} ago",
+                    format_age_ms(now_ms.saturating_sub(at.timestamp_millis()).max(0) as u64)
+                ),
+                false,
+            )
+        })
+    };
+    let tokens = (!s.tokens.is_zero())
+        .then(|| format!("{} tok", crate::lineage::format_token_count(s.tokens.total())));
+    DetailCells {
+        model,
+        ctx,
+        activity,
+        tokens,
     }
 }
 
-/// Four-cell context-window gauge plus percentage, e.g. `▰▰▱▱ 52%`.
-/// Fill rounds to the NEAREST quarter so the bar tracks the percentage —
-/// 54% reads as two cells (just over half), not three as ceiling would give.
-fn context_gauge_label(used: u64, window: u64) -> String {
-    let pct = used.saturating_mul(100) / window;
-    let filled = ((used.min(window).saturating_mul(4) + window / 2) / window) as usize;
-    let mut bar = String::new();
-    for i in 0..4 {
-        bar.push(if i < filled { '▰' } else { '▱' });
+/// Shared column widths for every full-mode detail line this frame, so
+/// the same field starts at the same x on every row and the list scans
+/// vertically. Computed over ALL materialized session rows (not just the
+/// viewport) so columns don't shift while scrolling. A column no row
+/// populates collapses to its one-cell placeholder.
+struct DetailColumns {
+    model_w: usize,
+    ctx_w: usize,
+    act_w: usize,
+    tok_w: usize,
+}
+
+fn compute_detail_columns(items: &[crate::app::ListItem], now_ms: i64) -> DetailColumns {
+    let mut cols = DetailColumns {
+        model_w: 1,
+        ctx_w: 1,
+        act_w: 1,
+        tok_w: 1,
+    };
+    for item in items {
+        let crate::app::ListItem::Session { summary, .. } = item else {
+            continue;
+        };
+        let cells = session_detail_cells(summary, now_ms);
+        cols.model_w = cols
+            .model_w
+            .max(UnicodeWidthStr::width(cells.model.as_str()).min(DETAIL_MODEL_W_MAX));
+        cols.ctx_w = cols.ctx_w.max(match &cells.ctx {
+            DetailCtx::Gauge(..) => DETAIL_GAUGE_W,
+            DetailCtx::Text(t) => UnicodeWidthStr::width(t.as_str()),
+            DetailCtx::None => 1,
+        });
+        if let Some((text, _)) = &cells.activity {
+            cols.act_w = cols.act_w.max(UnicodeWidthStr::width(text.as_str()));
+        }
+        if let Some(text) = &cells.tokens {
+            cols.tok_w = cols.tok_w.max(UnicodeWidthStr::width(text.as_str()));
+        }
     }
-    format!("{bar} {pct}%")
+    cols
+}
+
+/// The second row of a full-mode session card, laid out into the shared
+/// columns: model/identity left-aligned, context gauge, then activity
+/// and tokens right-anchored at the row edge (mirroring the harness
+/// label above). Columns that don't fit drop whole, right-to-left
+/// (tokens, then activity, then model — the gauge survives longest),
+/// identically on every row.
+fn session_detail_line(
+    theme: &Theme,
+    s: &SessionSummary,
+    cols: &DetailColumns,
+    now_ms: i64,
+    prefix_w: usize,
+    row_w: usize,
+) -> Line<'static> {
+    let cells = session_detail_cells(s, now_ms);
+    let avail = row_w.saturating_sub(prefix_w);
+    let mut include_tok = true;
+    let mut include_act = true;
+    let mut include_model = true;
+    let needed = |model: bool, act: bool, tok: bool| {
+        cols.ctx_w
+            + if model { cols.model_w + 2 } else { 0 }
+            + if act { cols.act_w + 2 } else { 0 }
+            + if tok { cols.tok_w + 2 } else { 0 }
+    };
+    if needed(true, true, true) > avail {
+        include_tok = false;
+    }
+    if !include_tok && needed(true, true, false) > avail {
+        include_act = false;
+    }
+    if !include_act && needed(true, false, false) > avail {
+        include_model = false;
+    }
+
+    // Archived rows keep their single dimmed style; live rows get a
+    // small hierarchy: values in the secondary style, units and
+    // placeholders dimmer, live compute in the running color.
+    let archived = s.archived;
+    let value_style = if archived {
+        Style::default().fg(theme.dim).add_modifier(Modifier::DIM)
+    } else {
+        session_list_secondary_style(theme)
+    };
+    let faint_style = if archived {
+        value_style
+    } else {
+        Style::default().fg(theme.dim)
+    };
+    let busy_style = if archived {
+        value_style
+    } else {
+        Style::default().fg(theme.success)
+    };
+
+    let mut spans = vec![Span::raw(" ".repeat(prefix_w))];
+    let mut used_w = 0usize;
+    if include_model {
+        let text = fit_name(&cells.model, cols.model_w, None);
+        let text_w = UnicodeWidthStr::width(text.as_str());
+        spans.push(Span::styled(text, value_style));
+        spans.push(Span::raw(" ".repeat(cols.model_w - text_w + 2)));
+        used_w += cols.model_w + 2;
+    }
+    match &cells.ctx {
+        DetailCtx::Gauge(filled, pct) => {
+            spans.push(Span::styled("▰".repeat(*filled), value_style));
+            spans.push(Span::styled("▱".repeat(4usize.saturating_sub(*filled)), faint_style));
+            let pct_text = format!("{pct}%");
+            spans.push(Span::raw(" ".repeat(5 - UnicodeWidthStr::width(pct_text.as_str()))));
+            spans.push(Span::styled(pct_text, value_style));
+            spans.push(Span::raw(" ".repeat(cols.ctx_w - DETAIL_GAUGE_W)));
+        }
+        DetailCtx::Text(text) => {
+            let text_w = UnicodeWidthStr::width(text.as_str());
+            let (value, unit) = text.rsplit_once(' ').unwrap_or((text.as_str(), ""));
+            spans.push(Span::styled(value.to_string(), value_style));
+            if !unit.is_empty() {
+                spans.push(Span::styled(format!(" {unit}"), faint_style));
+            }
+            spans.push(Span::raw(" ".repeat(cols.ctx_w.saturating_sub(text_w))));
+        }
+        DetailCtx::None => {
+            spans.push(Span::styled(DETAIL_EMPTY, faint_style));
+            spans.push(Span::raw(" ".repeat(cols.ctx_w - 1)));
+        }
+    }
+    used_w += cols.ctx_w;
+
+    // Right block: activity + tokens anchored at the row's right edge,
+    // each right-aligned within its column so suffixes line up.
+    let right_w = if include_act { cols.act_w + 2 } else { 0 }
+        + if include_tok { cols.tok_w + 2 } else { 0 };
+    if right_w > 0 {
+        // `right_w` already counts each right column's 2-cell separator;
+        // `gap` is only the extra slack that right-anchors the block.
+        let gap = avail.saturating_sub(used_w + right_w);
+        spans.push(Span::raw(" ".repeat(gap + 2)));
+        if include_act {
+            let (text, busy) = match &cells.activity {
+                Some((text, busy)) => (text.clone(), *busy),
+                None => (DETAIL_EMPTY.to_string(), false),
+            };
+            let text_w = UnicodeWidthStr::width(text.as_str());
+            spans.push(Span::raw(" ".repeat(cols.act_w.saturating_sub(text_w))));
+            if busy {
+                spans.push(Span::styled(text, busy_style));
+            } else if let Some(value) = text.strip_suffix(" ago") {
+                spans.push(Span::styled(value.to_string(), value_style));
+                spans.push(Span::styled(" ago".to_string(), faint_style));
+            } else {
+                spans.push(Span::styled(text, faint_style));
+            }
+            if include_tok {
+                spans.push(Span::raw("  "));
+            }
+        }
+        if include_tok {
+            let text = cells.tokens.as_deref().unwrap_or(DETAIL_EMPTY);
+            let text_w = UnicodeWidthStr::width(text);
+            spans.push(Span::raw(" ".repeat(cols.tok_w.saturating_sub(text_w))));
+            match text.strip_suffix(" tok") {
+                Some(value) => {
+                    spans.push(Span::styled(value.to_string(), value_style));
+                    spans.push(Span::styled(" tok".to_string(), faint_style));
+                }
+                None => spans.push(Span::styled(text.to_string(), faint_style)),
+            }
+        }
+    }
+    Line::from(spans)
+}
+
+/// Busy-time label: second-resolution under an hour (`54s`, `4m12s`),
+/// then the coarse single-unit age scale (`43h`, `2d`) — a long-lived
+/// session must not balloon into `2579m57s`.
+fn format_busy_ms(ms: u64) -> String {
+    if ms < 3_600_000 {
+        crate::lineage::format_duration_ms(ms)
+    } else {
+        format_age_ms(ms)
+    }
 }
 
 /// Compact model name for the detail line: drops the vendor prefix and a
@@ -2233,6 +2392,11 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     // Total cells available inside the bordered pane.
     let row_w = (area.width as usize).saturating_sub(2);
     let app_items = app.list_items();
+    // Full-mode detail lines share one set of column widths across the
+    // whole list, so fields align vertically row-to-row.
+    let detail_now_ms = chrono::Utc::now().timestamp_millis();
+    let detail_cols = (app.list_mode == crate::app::SessionListViewMode::Full)
+        .then(|| compute_detail_columns(&app_items, detail_now_ms));
     let mut selected_idx: Option<usize> = None;
     let item_lines: Vec<Vec<Line>> = app_items
         .iter()
@@ -2350,7 +2514,14 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     ]);
                     let mut lines = vec![Line::from(spans)];
                     if app.list_mode == crate::app::SessionListViewMode::Full {
-                        lines.push(session_detail_line(app, s, prefix_w, row_w));
+                        lines.push(session_detail_line(
+                            &app.theme,
+                            s,
+                            detail_cols.as_ref().expect("columns exist in full mode"),
+                            detail_now_ms,
+                            prefix_w,
+                            row_w,
+                        ));
                     }
                     lines
                 }
@@ -18106,7 +18277,7 @@ mod tests {
     }
 
     #[test]
-    fn detail_segments_show_model_gauge_activity_and_tokens() {
+    fn detail_cells_show_model_gauge_activity_and_tokens() {
         let mut s = lineage_test_summary("s1");
         s.model = Some("claude-opus-4-8".into());
         s.effort = Some("high".into());
@@ -18121,57 +18292,110 @@ mod tests {
         // Cost is deliberately NOT part of the detail line, even when the
         // session reports one.
         s.cost_usd = Some(1.42);
-        let segs = session_detail_segments(&s, 61_000);
-        let texts: Vec<&str> = segs.iter().map(|(t, _)| t.as_str()).collect();
-        assert_eq!(
-            texts,
-            vec!["opus-4-8\u{00b7}high", "▰▰▱▱ 50%", "busy 1m00s", "213k tok"]
-        );
-        // The gauge outlives everything else on a narrow pane; tokens drop
-        // first.
-        let gauge_priority = segs.iter().map(|(_, p)| *p).max().unwrap();
-        assert_eq!(segs[1].1, gauge_priority);
-        let min_priority = segs.iter().map(|(_, p)| *p).min().unwrap();
-        assert_eq!(segs.last().unwrap().1, min_priority);
+        let cells = session_detail_cells(&s, 61_000);
+        assert_eq!(cells.model, "opus-4-8\u{00b7}high");
+        assert!(matches!(cells.ctx, DetailCtx::Gauge(2, 50)));
+        assert_eq!(cells.activity, Some(("busy 1m00s".to_string(), true)));
+        assert_eq!(cells.tokens, Some("213k tok".to_string()));
     }
 
     #[test]
-    fn detail_segments_idle_age_and_shell_fallback() {
+    fn detail_cells_idle_age_and_shell_fallback() {
         use chrono::TimeZone;
         let mut s = lineage_test_summary("s1");
         s.state = SessionState::Done;
         s.last_event_at = Some(chrono::Utc.timestamp_millis_opt(0).unwrap());
-        let segs = session_detail_segments(&s, 7_200_000);
-        assert_eq!(segs[0].0, "2h ago");
+        let cells = session_detail_cells(&s, 7_200_000);
+        assert_eq!(cells.activity, Some(("2h ago".to_string(), false)));
 
         // With a message timestamp present, the age tracks the MESSAGE, not
         // the newer status/tool event — so restart resume plumbing (which
         // refreshes `last_event_at`) doesn't snap the age back to zero.
         s.last_message_at = Some(chrono::Utc.timestamp_millis_opt(0).unwrap());
         s.last_event_at = Some(chrono::Utc.timestamp_millis_opt(7_100_000).unwrap());
-        let segs = session_detail_segments(&s, 7_200_000);
-        assert_eq!(segs[0].0, "2h ago");
+        let cells = session_detail_cells(&s, 7_200_000);
+        assert_eq!(cells.activity, Some(("2h ago".to_string(), false)));
 
-        // A session reporting no model/usage data at all (a plain shell)
-        // falls back to where it lives.
+        // A session reporting no model (a plain shell) fills the identity
+        // column with where it lives instead.
         let mut sh = lineage_test_summary("sh");
         sh.state = SessionState::AwaitingInput;
         sh.cwd = "/Users/moon/agentd".into();
-        let segs = session_detail_segments(&sh, 0);
-        assert_eq!(segs, vec![("agentd".to_string(), 0)]);
+        let cells = session_detail_cells(&sh, 0);
+        assert_eq!(cells.model, "agentd");
+        assert!(matches!(cells.ctx, DetailCtx::None));
+        assert_eq!(cells.tokens, None);
     }
 
     #[test]
-    fn fit_detail_segments_drops_lowest_priority_first_then_ellipsizes() {
-        let segs = vec![
-            ("aaaa".to_string(), 3),
-            ("bbbb".to_string(), 4),
-            ("cccc".to_string(), 0),
-        ];
-        assert_eq!(fit_detail_segments(segs.clone(), 20), "aaaa  bbbb  cccc");
-        assert_eq!(fit_detail_segments(segs.clone(), 12), "aaaa  bbbb");
-        assert_eq!(fit_detail_segments(segs.clone(), 5), "bbbb");
-        assert_eq!(fit_detail_segments(segs, 2), "b…");
+    fn busy_label_goes_coarse_past_an_hour() {
+        assert_eq!(format_busy_ms(54_000), "54s");
+        assert_eq!(format_busy_ms(4 * 60_000 + 12_000), "4m12s");
+        assert_eq!(format_busy_ms(5 * 3_600_000), "5h");
+        // A long-lived busy session must not balloon into `2579m57s`.
+        assert_eq!(format_busy_ms(2579 * 60_000 + 57_000), "1d");
+        assert_eq!(format_busy_ms(3 * 86_400_000), "3d");
+    }
+
+    #[test]
+    fn detail_lines_align_into_shared_columns() {
+        use crate::app::ListItem as Item;
+        let mut a = lineage_test_summary("a");
+        a.state = SessionState::Done;
+        a.model = Some("fable-5".into());
+        a.context_used = Some(42_000);
+        a.context_window = Some(100_000);
+        a.last_message_at = Some(chrono::DateTime::from_timestamp_millis(0).unwrap());
+        a.tokens = construct_protocol::TokenTally {
+            input: 80_000_000,
+            output: 3_000_000,
+            cached: 0,
+        };
+        let mut b = lineage_test_summary("b");
+        b.state = SessionState::Done;
+        b.model = Some("gpt-5.6-terra".into());
+        b.effort = Some("medium".into());
+        b.context_used = Some(66_000);
+        b.context_window = Some(100_000);
+        b.last_message_at = Some(chrono::DateTime::from_timestamp_millis(0).unwrap());
+        b.tokens = construct_protocol::TokenTally {
+            input: 28_000_000,
+            output: 1_000_000,
+            cached: 0,
+        };
+        let item = |s: &SessionSummary| Item::Session {
+            summary: s.clone(),
+            indented: false,
+            has_children: false,
+            children_expanded: false,
+            attention_rollup: false,
+        };
+        let items = vec![item(&a), item(&b)];
+        let now = 3 * 3_600_000;
+        let cols = compute_detail_columns(&items, now);
+        // Model column sized by the widest visible model.
+        assert_eq!(cols.model_w, "gpt-5.6-terra\u{00b7}medium".chars().count());
+
+        let theme = Theme::default();
+        let line_a = session_detail_line(&theme, &a, &cols, now, 0, 60);
+        let line_b = session_detail_line(&theme, &b, &cols, now, 0, 60);
+        let text = |line: &Line| -> String { line.spans.iter().map(|sp| sp.content.as_ref()).collect() };
+        let (ta, tb) = (text(&line_a), text(&line_b));
+        // The gauge starts at the same column on both rows even though the
+        // model labels differ in width (char positions — `find` would
+        // compare byte offsets, and `·` is multi-byte)...
+        assert_eq!(
+            ta.chars().position(|c| c == '▰'),
+            tb.chars().position(|c| c == '▰'),
+            "{ta:?} vs {tb:?}"
+        );
+        // ...and both rows right-anchor tokens at the row edge.
+        assert!(ta.trim_end().ends_with("83M tok"), "{ta:?}");
+        assert!(tb.trim_end().ends_with("29M tok"), "{tb:?}");
+        assert_eq!(
+            UnicodeWidthStr::width(ta.trim_end()),
+            UnicodeWidthStr::width(tb.trim_end())
+        );
     }
 
     #[test]
@@ -18191,15 +18415,18 @@ mod tests {
     }
 
     #[test]
-    fn context_gauge_fill_rounds_to_nearest_quarter() {
-        assert_eq!(context_gauge_label(50_000, 200_000), "▰▱▱▱ 25%");
-        assert_eq!(context_gauge_label(200_000, 200_000), "▰▰▰▰ 100%");
+    fn context_gauge_fill_rounds_to_nearest_quarter_and_clamps() {
+        assert_eq!(context_gauge_fill(50_000, 200_000), (1, 25));
+        assert_eq!(context_gauge_fill(200_000, 200_000), (4, 100));
         // Just over half fills two cells, not three — the bar tracks the
         // percentage instead of ceiling up.
-        assert_eq!(context_gauge_label(54_000, 100_000), "▰▰▱▱ 54%");
+        assert_eq!(context_gauge_fill(54_000, 100_000), (2, 54));
         // ...and rounds up only past the midpoint of a quarter.
-        assert_eq!(context_gauge_label(63_000, 100_000), "▰▰▰▱ 63%");
-        assert_eq!(context_gauge_label(1, 200_000), "▱▱▱▱ 0%");
+        assert_eq!(context_gauge_fill(63_000, 100_000), (3, 63));
+        assert_eq!(context_gauge_fill(1, 200_000), (0, 0));
+        // Over-window reports (stale usage across a window change) cap at
+        // a full bar and 100% instead of showing `146%`.
+        assert_eq!(context_gauge_fill(146_000, 100_000), (4, 100));
     }
 
     #[test]
