@@ -35,6 +35,7 @@ sessions; it should be able to use `agentd_list_sessions` without running the
 | Claude Code | Enabled by default. | Adapter writes a config under `CONSTRUCT_STATE_DIR` and passes `--mcp-config <path>` pointing to `construct __mcp`. |
 | Codex | Enabled by default. | Adapter passes Codex a `-c mcp_servers.construct=...` TOML override pointing to `construct __mcp`. |
 | Antigravity | Not injected yet. | Receives `CONSTRUCT_SESSION_ID`; browser/tools can be injected once `agy` exposes an MCP config flag. |
+| Hermes | Not injected yet. | Hermes supports MCP in persistent config, but the adapter does not mutate user configuration; injection waits for a per-invocation config surface. |
 
 ## Fleet-control tools
 

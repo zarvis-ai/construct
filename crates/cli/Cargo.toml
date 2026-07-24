@@ -48,6 +48,7 @@ construct-adapter-opencode = { path = "../adapter-opencode" }
 construct-adapter-antigravity = { path = "../adapter-antigravity" }
 construct-adapter-grok = { path = "../adapter-grok" }
 construct-adapter-kimi = { path = "../adapter-kimi" }
+construct-adapter-hermes = { path = "../adapter-hermes" }
 construct-adapter-smith = { path = "../adapter-smith" }
 async-trait = { workspace = true }
 eventsource-stream = { workspace = true }

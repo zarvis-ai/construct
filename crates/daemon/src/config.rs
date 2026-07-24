@@ -25,7 +25,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # Active config:  ~/.config/construct/config.toml  (or $CONSTRUCT_CONFIG_DIR/config.toml)
 # This template:  ~/.config/construct/config.toml.template
 #
-# All built-in adapters (shell, claude, codex, opencode, antigravity, grok, kimi, smith) are
+# All built-in adapters (shell, claude, codex, opencode, antigravity, grok, kimi, hermes, smith) are
 # registered automatically — you do not need to declare them unless you want
 # to change a field.
 
@@ -43,6 +43,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 #   antigravity — Google Antigravity (wraps the `agy` CLI)
 #   grok        — Grok CLI (wraps the `grok` CLI)
 #   kimi        — Kimi Code (wraps the `kimi` CLI)
+#   hermes      — Hermes Agent (wraps the `hermes` CLI)
 #   smith       — native multi-provider agent (OpenAI / Anthropic / Gemini / Meta / Ollama / Grok)
 
 # [adapters.shell]
@@ -281,6 +282,7 @@ enabled = true
 #   CONSTRUCT_ANTIGRAVITY_CMD — command prefix for the antigravity adapter
 #   CONSTRUCT_GROK_CMD        — command prefix for the grok adapter
 #   CONSTRUCT_KIMI_CMD        — command prefix for the kimi adapter
+#   CONSTRUCT_HERMES_CMD      — command prefix for the hermes adapter
 #   CONSTRUCT_SHELL_CMD       — command prefix for the shell adapter
 #   CONSTRUCT_CLAUDE_BIN      — binary path fallback for the claude adapter
 #   CONSTRUCT_CODEX_BIN       — binary path fallback for the codex adapter
@@ -288,6 +290,7 @@ enabled = true
 #   CONSTRUCT_ANTIGRAVITY_BIN — binary path fallback for the antigravity adapter
 #   CONSTRUCT_GROK_BIN        — binary path fallback for the grok adapter
 #   CONSTRUCT_KIMI_BIN        — binary path fallback for the kimi adapter
+#   CONSTRUCT_HERMES_BIN      — binary path fallback for the hermes adapter
 "#;
 
 /// Kept for backwards-compat: `construct daemon default-config` and any
@@ -535,6 +538,12 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
         description: "Kimi Code (wraps the `kimi` CLI)",
     },
     BuiltinAdapter {
+        name: "hermes",
+        binary: "construct",
+        args: &["__adapter", "hermes"],
+        description: "Hermes Agent (wraps the `hermes` CLI)",
+    },
+    BuiltinAdapter {
         name: "smith",
         binary: "construct",
         args: &["__adapter", "smith"],
@@ -556,6 +565,7 @@ const DEFAULT_USAGE_PROBE: &[(&str, &str)] = &[
     // (confirmed live: an invalid `/usage <x>` argument error message
     // points at exactly "/usage show" or "/usage manage").
     ("grok", "/usage show"),
+    ("hermes", "/usage"),
 ];
 
 fn default_usage_probe(harness: &str) -> Option<&'static str> {
@@ -797,6 +807,7 @@ mod tests {
         assert_eq!(cfg.effective_usage_probe("codex"), Some("/status"));
         assert_eq!(cfg.effective_usage_probe("agy"), Some("/usage"));
         assert_eq!(cfg.effective_usage_probe("grok"), Some("/usage show"));
+        assert_eq!(cfg.effective_usage_probe("hermes"), Some("/usage"));
         // No built-in default and no override -> disabled.
         assert_eq!(cfg.effective_usage_probe("shell"), None);
         assert_eq!(cfg.effective_usage_probe("smith"), None);
@@ -810,6 +821,17 @@ mod tests {
             .expect("kimi builtin");
         assert_eq!(adapter.binary, "construct");
         assert_eq!(adapter.args, &["__adapter", "kimi"]);
+    }
+
+    #[test]
+    fn hermes_is_registered_as_a_builtin_wrapper() {
+        let adapter = BUILTIN_ADAPTERS
+            .iter()
+            .find(|adapter| adapter.name == "hermes")
+            .expect("hermes builtin");
+        assert_eq!(adapter.binary, "construct");
+        assert_eq!(adapter.args, &["__adapter", "hermes"]);
+        assert_eq!(default_usage_probe("hermes"), Some("/usage"));
     }
 
     #[test]

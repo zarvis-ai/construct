@@ -13,6 +13,7 @@ members = [
     "crates/adapter-antigravity",
     "crates/adapter-grok",
     "crates/adapter-kimi",
+    "crates/adapter-hermes",
     "crates/adapter-common",
     "crates/adapter-smith",
     "crates/e2e",
