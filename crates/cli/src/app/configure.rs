@@ -64,6 +64,10 @@ pub fn harness_guidance(name: &str) -> String {
                     PATH of the shell that starts the construct daemon (or installed at \
                     ~/.kimi-code/bin/kimi, or set CONSTRUCT_KIMI_BIN)"
             .to_string(),
+        "hermes" => "install Hermes Agent and run `hermes setup`; it must be on the PATH of the \
+                      shell that starts the construct daemon (or installed at \
+                      ~/.local/bin/hermes, or set CONSTRUCT_HERMES_BIN)"
+            .to_string(),
         "shell" => "nothing needed — always available".to_string(),
         "smith" => "see the Smith auth tab (→) for the auth methods smith supports and their \
                      live status"

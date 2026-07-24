@@ -98,12 +98,15 @@ env = { CONSTRUCT_CODEX_CMD = "exec codex" }
 | `antigravity` | `CONSTRUCT_ANTIGRAVITY_CMD` | `CONSTRUCT_ANTIGRAVITY_BIN` |
 | `grok` | `CONSTRUCT_GROK_CMD` | `CONSTRUCT_GROK_BIN` |
 | `kimi` | `CONSTRUCT_KIMI_CMD` | `CONSTRUCT_KIMI_BIN` |
+| `hermes` | `CONSTRUCT_HERMES_CMD` | `CONSTRUCT_HERMES_BIN` |
 | `shell` | `CONSTRUCT_SHELL_CMD` | `CONSTRUCT_SHELL_BIN` |
 
 OpenCode discovery checks `opencode` on the daemon's `PATH`, then the standard
 installer location at `~/.opencode/bin/opencode`. Kimi Code discovery likewise
 checks `kimi` on `PATH`, then `~/.kimi-code/bin/kimi`. The explicit command and
-binary overrides above take precedence over both.
+binary overrides above take precedence over both. Hermes discovery checks
+`hermes` on `PATH`, then `~/.local/bin/hermes`; set `CONSTRUCT_HERMES_HOME`
+when its config and `state.db` live outside the default `~/.hermes`.
 
 ## TUI Theme
 

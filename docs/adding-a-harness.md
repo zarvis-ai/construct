@@ -210,27 +210,27 @@ daemon once the events above are emitted.
 
 ## 3. Capability matrix
 
-Snapshot of where each harness stands (2026-07-21). Re-audit by checking the
+Snapshot of where each harness stands (2026-07-24). Re-audit by checking the
 listed data surface, not by trusting this table — upstream CLIs grow
 surfaces between releases (codex's token splits and grok's context figures
 both existed for months before we consumed them).
 
-| Capability | smith | claude | codex | opencode | kimi | grok | antigravity | shell |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Interactive / headless | both | both | both | interactive | interactive | both | both | PTY |
-| Structured chat events | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | n/a |
-| ModelChanged | ✓ | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | n/a |
-| EffortChanged | ✓ | — | ✓ | — | ✓ | ✓ | ✓ | n/a |
-| Token split (0103) | ✓ | ✓ | ✓ | ✓ | ✓ | gap² | none³ | n/a |
-| Context gauge (0104) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | none³ | n/a |
-| USD cost | ✓ | headless only | — | gap⁴ | — | — | — | n/a |
-| Native resume | ✓ (own state) | ✓ | ✓ | ✓ | ✓ | ✓ | — | fresh shell |
-| Reset detection (0085) | n/a | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | n/a |
-| Native fork | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | n/a |
-| Native subagent mirrors | n/a⁵ | ✓ | ✓ | — | — | ✓ | ✓ | n/a |
-| MCP injection | native tools | ✓ | ✓ | ✓ | gap | gap | gap | — |
-| Approval translation | native | ✓ | — | — | — | ✓ | — | n/a |
-| Usage probe (0086) | disabled | `/usage` | `/status` | — | — | `/usage show` | `/usage` | disabled |
+| Capability | smith | claude | codex | opencode | kimi | hermes | grok | antigravity | shell |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Interactive / headless | both | both | both | interactive | interactive | both | both | both | PTY |
+| Structured chat events | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | n/a |
+| ModelChanged | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓¹ | ✓ | n/a |
+| EffortChanged | ✓ | — | ✓ | — | ✓ | ✓ | ✓ | ✓ | n/a |
+| Token split (0103) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | gap² | none³ | n/a |
+| Context gauge (0104) | ✓ | ✓ | ✓ | ✓ | ✓ | gap | ✓ | none³ | n/a |
+| USD cost | ✓ | headless only | — | gap⁴ | — | ✓ | — | — | n/a |
+| Native resume | ✓ (own state) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | — | fresh shell |
+| Reset detection (0085) | n/a | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | n/a |
+| Native fork | ✓ | ✓ | ✓ | ✓ | ✓ | — | ✓ | — | n/a |
+| Native subagent mirrors | n/a⁵ | ✓ | ✓ | — | — | gap | ✓ | ✓ | n/a |
+| MCP injection | native tools | ✓ | ✓ | ✓ | gap | gap | gap | gap | — |
+| Approval translation | native | ✓ | — | — | — | — | ✓ | — | n/a |
+| Usage probe (0086) | disabled | `/usage` | `/status` | — | — | `/usage` | `/usage show` | `/usage` | disabled |
 
 ¹ grok reports the model, but its upstream `model_id` was observed frozen
 per session — a mid-session switch may go unreported (investigation note in
@@ -257,6 +257,7 @@ short real session:
 | kimi | `~/.kimi-code/sessions/<wd>/<session>/agents/*/wire.jsonl` | `step.end` usage (full split) + per-step latency metrics, `config.update` (model, effort), `usage.record` per turn |
 | opencode | `~/.local/share/opencode/opencode.db` (sqlite `message`) — reachable live via the plugin's `message.updated` events | `tokens` (input/output/reasoning/cache r+w), exact `cost` USD, provider/model, per-message timestamps |
 | grok | `~/.grok/sessions/<cwd-enc>/<session>/` (`signals.json`, `updates.jsonl`, `chat_history.jsonl`) | `contextTokensUsed`/`contextWindowTokens`, `totalTokens` (unsplit), turn/tool counters, session summary |
+| hermes | `$HERMES_HOME/state.db` (`sessions`, `messages`) | source-tagged native id, model/reasoning config, full structured messages/tool calls, token split, estimated/actual USD cost |
 | antigravity | — | nothing usable found in print mode or logs |
 
 ## 5. Verification checklist

@@ -543,7 +543,10 @@ struct PtyInputCapture {
 }
 
 fn should_record_pty_user_message(harness: &str) -> bool {
-    matches!(harness, "claude" | "antigravity" | "agy" | "grok")
+    matches!(
+        harness,
+        "claude" | "antigravity" | "agy" | "grok" | "hermes"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -560,7 +563,7 @@ fn program_execution_delivery(
         ProgramExecutionDelivery::AdapterInput
     } else if matches!(
         summary.harness.as_str(),
-        "claude" | "codex" | "antigravity" | "agy" | "grok"
+        "claude" | "codex" | "antigravity" | "agy" | "grok" | "hermes"
     ) {
         ProgramExecutionDelivery::ExternalPtyTypedSubmit
     } else {
@@ -2310,6 +2313,14 @@ impl SessionManager {
                 &construct_protocol::adapter::default_cli_bin_with_home_fallback(
                     "kimi",
                     std::path::Path::new(".kimi-code/bin/kimi"),
+                ),
+            ),
+            "hermes" => probe_wrapper_cli(
+                "CONSTRUCT_HERMES_CMD",
+                "CONSTRUCT_HERMES_BIN",
+                &construct_protocol::adapter::default_cli_bin_with_home_fallback(
+                    "hermes",
+                    std::path::Path::new(".local/bin/hermes"),
                 ),
             ),
             "smith" => probe_smith(&self.availability_cache).await,
@@ -4859,6 +4870,7 @@ impl SessionManager {
             "opencode" => Some("opencode_session_id.txt"),
             "grok" => Some("grok_session_id.txt"),
             "kimi" => Some("kimi_session_id.txt"),
+            "hermes" => Some("hermes_session_id.txt"),
             _ => None,
         }
     }
@@ -5301,7 +5313,7 @@ fn harness_uses_quiescence(s: &SessionSummary) -> bool {
     s.has_pty
         && matches!(
             s.harness.as_str(),
-            "claude" | "codex" | "antigravity" | "agy" | "grok"
+            "claude" | "codex" | "antigravity" | "agy" | "grok" | "hermes"
         )
 }
 
@@ -5353,7 +5365,7 @@ fn effective_mode(params: &CreateSessionParams) -> String {
 fn builtin_harness_capabilities(name: &str) -> construct_protocol::Capabilities {
     match name {
         "shell" | "claude" | "codex" | "opencode" | "antigravity" | "agy" | "grok" | "kimi"
-        | "smith" => {
+        | "hermes" | "smith" => {
             construct_protocol::Capabilities {
                 supports_pty: true,
                 ..Default::default()
@@ -9135,6 +9147,7 @@ mod tests {
             "agy",
             "grok",
             "kimi",
+            "hermes",
             "smith",
         ] {
             assert!(

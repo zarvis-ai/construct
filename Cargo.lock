@@ -645,6 +645,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "construct-adapter-hermes"
+version = "0.15.4"
+dependencies = [
+ "anyhow",
+ "construct-adapter-common",
+ "construct-protocol",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "construct-adapter-kimi"
 version = "0.15.4"
 dependencies = [
@@ -718,6 +731,7 @@ dependencies = [
  "construct-adapter-claude",
  "construct-adapter-codex",
  "construct-adapter-grok",
+ "construct-adapter-hermes",
  "construct-adapter-kimi",
  "construct-adapter-opencode",
  "construct-adapter-shell",

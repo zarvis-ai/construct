@@ -334,6 +334,8 @@ enum AdapterCommand {
     #[command(hide = true)]
     Kimi,
     #[command(hide = true)]
+    Hermes,
+    #[command(hide = true)]
     Smith {
         /// Auto-title mode: generate a short title for the given prompt.
         #[arg(long)]
@@ -728,6 +730,10 @@ async fn main() -> Result<()> {
             }
             AdapterCommand::Kimi => {
                 construct_adapter_kimi::run().await?;
+                Ok(())
+            }
+            AdapterCommand::Hermes => {
+                construct_adapter_hermes::run().await?;
                 Ok(())
             }
             AdapterCommand::Smith {
